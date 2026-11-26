@@ -186,16 +186,24 @@ class NotionKanbanView extends obsidian.BasesView {
   settings() {
     const columnKey = propKey(this.cfg("columnProperty", "note.Status")) || "Status";
     const laneRaw = this.cfg("laneProperty", "note.Team");
-    const laneKey = laneRaw === "none" ? null : propKey(laneRaw);
+    const laneId = !laneRaw || laneRaw === "none" ? null : String(laneRaw);
+    // laneKey is set only for frontmatter properties, which drag-and-drop can write to.
+    const laneKey = laneId ? propKey(laneId) : null;
+    const subRaw = this.cfg("subtaskProperty", "note.Sub-task");
     const order = asList(this.cfg("columnOrder", []));
     return {
       columnKey,
+      laneId,
       laneKey,
+      laneOrder: asList(this.cfg("laneOrder", [])).map(String),
+      laneColors: parseMap(this.cfg("laneColors", []), []),
+      hideEmptyLanes: !!this.cfg("hideEmptyLanes", false),
+      showPropertyLabels: !!this.cfg("showPropertyLabels", false),
       columnOrder: order.length ? order.map(String) : DEFAULT_COLUMN_ORDER,
       hideUnlisted: !!this.cfg("hideUnlistedColumns", false),
       hideEmptyColumns: !!this.cfg("hideEmptyColumns", false),
       columnColors: parseMap(this.cfg("columnColors", []), DEFAULT_COLUMN_COLORS),
-      subtaskKey: propKey(this.cfg("subtaskProperty", "note.Sub-task")),
+      subtaskKey: subRaw === "none" ? null : propKey(subRaw),
       tagKey: propKey(this.cfg("tagProperty", "note.Tag")),
       tagColors: parseMap(this.cfg("tagColors", []), DEFAULT_TAG_COLORS),
       waitingKey: propKey(this.cfg("waitingProperty", "note.Waiting")),
@@ -232,7 +240,7 @@ class NotionKanbanView extends obsidian.BasesView {
     const cards = entries.map((e, idx) => {
       const fm = this.fm(e.file);
       const status = asString(asList(fm[s.columnKey])[0]) || NO_VALUE;
-      const lane = s.laneKey ? asString(asList(fm[s.laneKey])[0]) || NO_VALUE : null;
+      const lane = s.laneId ? this.laneValue(e, fm, s) : null;
       const ord = s.orderKey ? Number(fm[s.orderKey]) : NaN;
       return { entry: e, file: e.file, fm, status, lane, order: Number.isFinite(ord) ? ord : null, idx };
     });
@@ -251,10 +259,21 @@ class NotionKanbanView extends obsidian.BasesView {
 
     // lanes
     let lanes = [null];
-    if (s.laneKey) {
+    if (s.laneId) {
       const counts = new Map();
       for (const c of cards) counts.set(c.lane, (counts.get(c.lane) || 0) + 1);
-      lanes = [...counts.keys()].sort((a, b) => (a === NO_VALUE ? 1 : b === NO_VALUE ? -1 : a.localeCompare(b)));
+      // lanes listed in "Lane order" come first, in that order; the rest follow alphabetically
+      const rank = new Map(s.laneOrder.map((v, i) => [v.toLowerCase(), i]));
+      const found = [...counts.keys()];
+      if (!s.hideEmptyLanes) {
+        for (const v of s.laneOrder) if (!found.some((f) => f.toLowerCase() === v.toLowerCase())) found.push(v);
+      }
+      lanes = found.sort((a, b) => {
+        const ra = rank.has(a.toLowerCase()) ? rank.get(a.toLowerCase()) : Infinity;
+        const rb = rank.has(b.toLowerCase()) ? rank.get(b.toLowerCase()) : Infinity;
+        if (ra !== rb) return ra - rb;
+        return a === NO_VALUE ? 1 : b === NO_VALUE ? -1 : a.localeCompare(b);
+      });
       if (!lanes.length) lanes = [NO_VALUE];
     }
 
@@ -278,6 +297,18 @@ class NotionKanbanView extends obsidian.BasesView {
     return { cards, columns, lanes, buckets };
   }
 
+  laneValue(entry, fm, s) {
+    if (s.laneKey) return asString(asList(fm[s.laneKey])[0]) || NO_VALUE;
+    // formula.* and file.* values come from Bases itself
+    try {
+      const v = entry.getValue(s.laneId);
+      const t = v ? v.toString() : "";
+      return t && t !== "null" ? t : NO_VALUE;
+    } catch (e) {
+      return NO_VALUE;
+    }
+  }
+
   subtaskState(file, s) {
     const fm = this.fm(file);
     const status = asString(asList(fm[s.columnKey])[0]).toLowerCase();
@@ -287,7 +318,7 @@ class NotionKanbanView extends obsidian.BasesView {
     if (s.doneValues.has(status)) return "done";
     if (blockedBy.length || tags.includes("blocked") || status === "blocked") return "blocked";
     if (status === "in progress") return "progress";
-    if (waiting === "waiting" || waiting === "true" || fm[s.waitingKey] === true) return "waiting";
+    if (tags.some((t) => t.includes("waiting")) || waiting === "true" || fm[s.waitingKey] === true) return "waiting";
     return "todo";
   }
 
@@ -327,13 +358,13 @@ class NotionKanbanView extends obsidian.BasesView {
     });
 
     for (const lane of lanes) {
-      if (s.laneKey) {
+      if (s.laneId) {
         const collapsed = this.collapsedLanes.has(lane);
         const lh = board.createDiv({ cls: "nk-lane-header" + (collapsed ? " is-collapsed" : "") });
         const caret = lh.createSpan({ cls: "nk-caret" });
         setIconSafe(caret, ["chevron-down"]);
         const lanePill = lh.createSpan({ cls: "nk-lane-pill", text: lane });
-        lanePill.style.setProperty("--nk-rgb", rgbFor(s.tagColors.get(lane.toLowerCase()) || "blue"));
+        lanePill.style.setProperty("--nk-rgb", rgbFor(s.laneColors.get(lane.toLowerCase()) || s.tagColors.get(lane.toLowerCase()) || "blue"));
         let n = 0;
         columns.forEach((_, ci) => (n += (buckets.get(`${lane}\u0000${ci}`) || []).length));
         lh.createSpan({ cls: "nk-count", text: String(n) });
@@ -394,7 +425,7 @@ class NotionKanbanView extends obsidian.BasesView {
     }
 
     // extra properties chosen in the Bases "Properties" menu
-    const skip = new Set(["file.name", "note." + s.subtaskKey, "note." + s.tagKey, "note." + s.iconKey]);
+    const skip = new Set(["file.name", "note." + s.subtaskKey, "note." + s.tagKey, "note." + s.iconKey, "note." + s.orderKey]);
     let order = [];
     try { order = this.config.getOrder() || []; } catch (e) { order = []; }
     const extras = order.filter((id) => !skip.has(id));
@@ -402,19 +433,26 @@ class NotionKanbanView extends obsidian.BasesView {
       const props = card.createDiv({ cls: "nk-props" });
       for (const id of extras) {
         let text = "";
+        let links = [];
         const k = propKey(id);
         if (k) {
-          const v = c.fm[k];
-          text = asList(v).map((x) => (typeof x === "string" && x.startsWith("[[") ? this.resolve(x, c.file.path).name : asString(x))).join(", ");
+          const vals = asList(c.fm[k]);
+          links = vals.filter((x) => typeof x === "string" && x.startsWith("[["));
+          text = vals.filter((x) => !links.includes(x)).map(asString).filter(Boolean).join(", ");
         } else {
           try { const v = c.entry.getValue(id); text = v ? v.toString() : ""; } catch (e) { text = ""; }
         }
-        if (!text || text === "null") continue;
-        let label = id;
-        try { label = this.config.getDisplayName(id); } catch (e) {}
+        if (text === "null") text = "";
+        if (!text && !links.length) continue;
         const pr = props.createDiv({ cls: "nk-prop" });
-        pr.createSpan({ cls: "nk-prop-label", text: label });
-        pr.createSpan({ cls: "nk-prop-value", text });
+        if (s.showPropertyLabels) {
+          let label = id;
+          try { label = this.config.getDisplayName(id); } catch (e) {}
+          pr.createSpan({ cls: "nk-prop-label", text: label });
+        }
+        const val = pr.createSpan({ cls: "nk-prop-value" });
+        for (const raw of links) this.renderLinkChip(val, raw, c, s);
+        if (text) val.createSpan({ text });
       }
       if (!props.childElementCount) props.remove();
     }
@@ -496,6 +534,28 @@ class NotionKanbanView extends obsidian.BasesView {
       this.rootEl && this.rootEl.querySelectorAll(".nk-drop-marker").forEach((m) => m.remove());
       if (this.dragPath) { this.dragPath = null; this.renderSoon(); }
     });
+  }
+
+  // A linked note, drawn like a Notion relation: its icon, then its underlined name.
+  renderLinkChip(parent, raw, c, s) {
+    const r = this.resolve(raw, c.file.path);
+    const chip = parent.createSpan({ cls: "nk-link" + (r.file ? "" : " is-unresolved") });
+    const iconVal = r.file && s.iconKey ? asString(this.fm(r.file)[s.iconKey]) : "";
+    const ic = chip.createSpan({ cls: "nk-link-icon" });
+    if (!(iconVal && renderIconValue(ic, iconVal))) setIconSafe(ic, ["file-text", "file"]);
+    chip.createSpan({ cls: "nk-link-name", text: r.name });
+    if (r.file) this.childPaths.add(r.file.path);
+    chip.onclick = (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      this.app.workspace.openLinkText(r.file ? r.file.path : r.linkpath, c.file.path, obsidian.Keymap.isModEvent(ev));
+    };
+    chip.onmouseover = (ev) => {
+      this.app.workspace.trigger("hover-link", {
+        event: ev, source: HOVER_SOURCE, hoverParent: this, targetEl: chip,
+        linktext: r.file ? r.file.path : r.linkpath, sourcePath: c.file.path,
+      });
+    };
   }
 
   // ----- drag & drop -----
@@ -630,7 +690,12 @@ function viewOptions() {
     {
       type: "group",
       displayName: "Swimlanes",
-      items: [{ type: "property", key: "laneProperty", displayName: "Swimlane property", placeholder: "Team" }],
+      items: [
+        { type: "property", key: "laneProperty", displayName: "Swimlane property", placeholder: "Team" },
+        { type: "multitext", key: "laneOrder", displayName: "Swimlane order (others follow A-Z)", default: [] },
+        { type: "multitext", key: "laneColors", displayName: "Swimlane colors (Value=color)", default: [] },
+        { type: "toggle", key: "hideEmptyLanes", displayName: "Hide empty swimlanes", default: false },
+      ],
     },
     {
       type: "group",
@@ -645,6 +710,7 @@ function viewOptions() {
         { type: "property", key: "iconProperty", displayName: "Icon property", placeholder: "icon" },
         { type: "dropdown", key: "defaultIcon", displayName: "Icon when none set", default: "circle", options: { circle: "Circle", none: "None" } },
         { type: "property", key: "orderProperty", displayName: "Manual order property", placeholder: "manual_order" },
+        { type: "toggle", key: "showPropertyLabels", displayName: "Show property names on cards", default: false },
         { type: "dropdown", key: "cardWidth", displayName: "Column width", default: "medium", options: { small: "Small", medium: "Medium", large: "Large" } },
       ],
     },

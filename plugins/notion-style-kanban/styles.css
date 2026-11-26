@@ -166,6 +166,20 @@
 .nk-prop { display: flex; gap: 6px; }
 .nk-prop-label { color: var(--text-faint); flex: none; }
 .nk-prop-value { color: var(--text-muted); word-break: break-word; }
+.nk-prop-value { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 8px; }
+/* linked notes (e.g. Parent task), drawn like Notion relations */
+.nk-link { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; min-width: 0; }
+.nk-link-icon { display: inline-flex; flex: none; width: 14px; height: 14px; align-items: center; justify-content: center; font-size: 12px; line-height: 1; }
+.nk-link-icon svg { width: 14px; height: 14px; }
+.nk-link-name {
+  color: var(--text-muted);
+  text-decoration: underline;
+  text-decoration-color: var(--text-faint);
+  text-underline-offset: 3px;
+  word-break: break-word;
+}
+.nk-link:hover .nk-link-name { color: var(--text-normal); text-decoration-color: var(--text-normal); }
+.nk-link.is-unresolved .nk-link-name { color: var(--text-faint); }
 
 /* sub-tasks */
 .nk-subtasks {
