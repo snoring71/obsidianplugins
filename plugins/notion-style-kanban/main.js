@@ -91,6 +91,7 @@ function setIconSafe(el, names) {
 
 // Notion icon names (as returned by Notion's API, e.g. "icons/no_yellow") -> Lucide icons
 const NOTION_ICON_MAP = {
+  location: ["map-pin"], "grid-wide-six": ["layout-grid"], torii: ["landmark"], layers: ["layers"],
   no: ["ban"], "checkmark-square": ["square-check", "check-square"], checkbox: ["square"],
   "checkmark-square-filled": ["square-check"], checkmark: ["check"], "checkmark-line": ["check"],
   more: ["ellipsis", "more-horizontal"], "dots-horizontal": ["ellipsis"], ellipsis: ["ellipsis"],
@@ -739,12 +740,14 @@ class IconPicker {
   constructor(plugin, file, iconKey, anchorEl, pos) {
     this.plugin = plugin;
     this.app = plugin.app;
-    this.file = file;
+    // `file` is a note, or a custom target { current, write(value) } (e.g. a view tab)
+    this.target = file && typeof file.write === "function" ? file : null;
+    this.file = this.target ? null : file;
     this.iconKey = iconKey || "icon";
     this.anchorEl = anchorEl;
     this.pos = pos;
-    const fm = (this.app.metadataCache.getFileCache(file) || {}).frontmatter || {};
-    const cur = asString(fm[this.iconKey]);
+    const fm = this.file ? (this.app.metadataCache.getFileCache(file) || {}).frontmatter || {} : {};
+    const cur = this.target ? asString(this.target.current) : asString(fm[this.iconKey]);
     const m = cur.match(/:([a-z]+)$/) || cur.match(/^icons\/.*_([a-z]+)$/);
     this.color = m && PICKER_COLORS.includes(m[1]) ? m[1] : (m && NOTION_ICON_COLORS[m[1]]) || "default";
     const s = plugin.settings;
@@ -995,10 +998,12 @@ class IconPicker {
 
   async save(value, manual) {
     const key = this.iconKey;
-    await this.app.fileManager.processFrontMatter(this.file, (fm) => {
-      if (value === null) delete fm[key];
-      else fm[key] = value;
-    });
+    if (this.target) await this.target.write(value);
+    else
+      await this.app.fileManager.processFrontMatter(this.file, (fm) => {
+        if (value === null) delete fm[key];
+        else fm[key] = value;
+      });
     if (value && manual) {
       const s = this.plugin.settings;
       s.recentIcons = [value, ...s.recentIcons.filter((v) => v !== value)].slice(0, RECENT_LIMIT);
@@ -1079,11 +1084,163 @@ class NoteIconHeader {
   }
 }
 
+// ---------- Notion-style view tabs above every base ----------
+
+const VIEW_TYPE_ICONS = { table: "table", cards: "layout-grid", list: "list", kanban: "square-kanban", "notion-kanban": "square-kanban", map: "map" };
+
+class ViewTabsBar {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.app = plugin.app;
+    this.refreshSoon = obsidian.debounce(() => this.refreshAll(), 60, true);
+    this.viewsCache = new Map(); // base path -> { mtime, views }
+  }
+
+  load() {
+    const p = this.plugin;
+    p.registerEvent(this.app.workspace.on("layout-change", () => this.refreshSoon()));
+    p.registerEvent(this.app.workspace.on("active-leaf-change", () => this.refreshSoon()));
+    p.registerEvent(this.app.vault.on("modify", (f) => { if (f.extension === "base") { this.viewsCache.delete(f.path); this.refreshSoon(); } }));
+    p.registerEvent(this.app.vault.on("rename", () => this.refreshSoon()));
+    // Bases redraws its content when the view changes; re-attach / re-highlight then
+    this.observer = new MutationObserver(() => this.refreshSoon());
+    this.app.workspace.onLayoutReady(() => this.refreshAll());
+  }
+
+  unload() {
+    if (this.observer) this.observer.disconnect();
+    document.querySelectorAll(".nk-view-tabs").forEach((e) => e.remove());
+  }
+
+  settings() {
+    const s = this.plugin.settings;
+    if (!s.viewTabs) s.viewTabs = {};
+    return s.viewTabs;
+  }
+
+  key(path, name) { return `${path}::${name}`; }
+
+  async getViews(file) {
+    const c = this.viewsCache.get(file.path);
+    if (c && c.mtime === file.stat.mtime) return c.views;
+    let views = [];
+    try {
+      const data = obsidian.parseYaml(await this.app.vault.cachedRead(file)) || {};
+      views = (Array.isArray(data.views) ? data.views : []).filter((v) => v && v.name).map((v) => ({ name: String(v.name), type: String(v.type || "") }));
+    } catch (e) { views = []; }
+    this.viewsCache.set(file.path, { mtime: file.stat.mtime, views });
+    return views;
+  }
+
+  async refreshAll() {
+    if (this.observer) this.observer.disconnect();
+    for (const leaf of this.app.workspace.getLeavesOfType("bases")) {
+      try { await this.renderInLeaf(leaf); } catch (e) { console.error("[notion-style-kanban] tabs", e); }
+    }
+  }
+
+  async renderInLeaf(leaf) {
+    const view = leaf.view;
+    const content = view && view.containerEl && view.containerEl.querySelector(":scope > .view-content");
+    const file = view && view.file;
+    if (!content || !file) return;
+    const views = await this.getViews(file);
+    let state = {};
+    try { state = (leaf.getViewState() || {}).state || {}; } catch (e) {}
+    const current = state.viewName || (views[0] && views[0].name) || "";
+    const conf = this.settings();
+    const hidden = new Set((conf[file.path] && conf[file.path].hidden) || []);
+    const sig = JSON.stringify([file.path, current, views, [...hidden], views.map((v) => conf[this.key(file.path, v.name)] || "")]);
+
+    let bar = content.querySelector(":scope > .nk-view-tabs");
+    if (!bar || content.firstElementChild !== bar) {
+      if (bar) bar.remove();
+      bar = createDiv({ cls: "nk-view-tabs" });
+      content.prepend(bar);
+      bar.dataset.sig = "";
+    }
+    if (this.observer) this.observer.observe(content, { childList: true });
+    if (bar.dataset.sig === sig) return;
+    bar.dataset.sig = sig;
+    bar.empty();
+    if (views.length < 2) { bar.hide(); return; }
+    bar.show();
+
+    const shown = views.filter((v) => !hidden.has(v.name) || v.name === current);
+    for (const v of shown) {
+      const tab = bar.createDiv({ cls: "nk-view-tab" + (v.name === current ? " is-active" : "") });
+      const ic = tab.createSpan({ cls: "nk-view-tab-icon" });
+      const iconVal = conf[this.key(file.path, v.name)];
+      if (!(iconVal && renderIconValue(ic, iconVal))) setIconSafe(ic, [VIEW_TYPE_ICONS[v.type] || "layout-list"]);
+      tab.createSpan({ cls: "nk-view-tab-name", text: v.name });
+      tab.onclick = () => { if (v.name !== current) this.switchTo(leaf, file, v.name); };
+      tab.oncontextmenu = (ev) => {
+        ev.preventDefault();
+        const menu = new obsidian.Menu();
+        menu.addItem((i) => i.setTitle("Change icon").setIcon("smile-plus").onClick(() => this.pickIcon(file, v.name, ic)));
+        if (v.name !== current)
+          menu.addItem((i) => i.setTitle("Hide from tab bar").setIcon("eye-off").onClick(() => this.setHidden(file, v.name, true)));
+        menu.showAtMouseEvent(ev);
+      };
+    }
+    const hiddenViews = views.filter((v) => hidden.has(v.name) && v.name !== current);
+    if (hiddenViews.length) {
+      const more = bar.createDiv({ cls: "nk-view-tab nk-view-tab-more", text: `${hiddenViews.length} more…` });
+      more.onclick = (ev) => {
+        const menu = new obsidian.Menu();
+        for (const v of hiddenViews) {
+          menu.addItem((i) => i.setTitle(v.name).setIcon(VIEW_TYPE_ICONS[v.type] || "layout-list").onClick(() => this.switchTo(leaf, file, v.name)));
+        }
+        menu.addSeparator();
+        for (const v of hiddenViews) {
+          menu.addItem((i) => i.setTitle(`Show "${v.name}" tab`).setIcon("eye").onClick(() => this.setHidden(file, v.name, false)));
+        }
+        menu.showAtMouseEvent(ev);
+      };
+    }
+  }
+
+  async switchTo(leaf, file, name) {
+    const vs = leaf.getViewState();
+    vs.state = Object.assign({}, vs.state || {}, { file: file.path, viewName: name });
+    await leaf.setViewState(vs);
+    this.refreshSoon();
+  }
+
+  async setHidden(file, name, hide) {
+    const conf = this.settings();
+    const entry = conf[file.path] || (conf[file.path] = { hidden: [] });
+    entry.hidden = entry.hidden.filter((n) => n !== name);
+    if (hide) entry.hidden.push(name);
+    await this.plugin.saveData(this.plugin.settings);
+    this.refreshAll();
+  }
+
+  pickIcon(file, name, anchorEl) {
+    const conf = this.settings();
+    const k = this.key(file.path, name);
+    this.plugin.openIconPicker({
+      current: conf[k] || "",
+      write: async (value) => {
+        if (value) conf[k] = value; else delete conf[k];
+        await this.plugin.saveData(this.plugin.settings);
+        this.refreshAll();
+      },
+    }, "icon", anchorEl);
+  }
+}
+
 class NotionStyleKanbanPlugin extends obsidian.Plugin {
   openIconPicker(file, iconKey, anchorEl, pos) {
     if (this.activePicker) this.activePicker.close();
     this.activePicker = new IconPicker(this, file, iconKey || "icon", anchorEl, pos);
     this.activePicker.open();
+  }
+
+  async onExternalSettingsChange() {
+    const fresh = (await this.loadData()) || {};
+    Object.assign(this.settings, fresh);
+    if (this.viewTabs) this.viewTabs.refreshAll();
   }
 
   async onload() {
@@ -1094,6 +1251,10 @@ class NotionStyleKanbanPlugin extends obsidian.Plugin {
     this.noteIcons = new NoteIconHeader(this);
     this.noteIcons.load();
     this.register(() => this.noteIcons.unload());
+
+    this.viewTabs = new ViewTabsBar(this);
+    this.viewTabs.load();
+    this.register(() => this.viewTabs.unload());
 
     // "Change icon" on any note's right-click menu (cards, sub-tasks, file explorer, tabs)
     let lastMouse = null;
