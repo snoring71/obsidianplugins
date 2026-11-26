@@ -1,0 +1,4 @@
+# Per-vault plugin settings (recent/saved icons etc.)
+data.json
+node_modules/
+.DS_Store
