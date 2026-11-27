@@ -2416,6 +2416,55 @@ class CommentsPanel {
   }
 }
 
+// Live Preview: hide the raw comment callouts entirely (even when the cursor is
+// on them), so opening a note never flashes the unformatted text.
+function commentHiderExtension() {
+  let cmState, cmView;
+  try {
+    cmState = require("@codemirror/state");
+    cmView = require("@codemirror/view");
+  } catch (e) {
+    return [];
+  }
+  const { StateField } = cmState;
+  const { Decoration, EditorView } = cmView;
+  const isLive = (state) => {
+    try {
+      return obsidian.editorLivePreviewField ? !!state.field(obsidian.editorLivePreviewField, false) : true;
+    } catch (e) {
+      return true;
+    }
+  };
+  const build = (state) => {
+    if (!isLive(state)) return Decoration.none;
+    const doc = state.doc;
+    // only the top of the note matters; cap the text we parse
+    const head = doc.sliceString(0, Math.min(doc.length, 200000));
+    const p = parseComments(head);
+    if (!p.threads.length) return Decoration.none;
+    let last = p.end; // exclusive line index (0-based)
+    while (last < p.lines.length - 1 && p.lines[last].trim() === "") last++;
+    // last is now the first content line (or a trailing line); hide through the line before it
+    const fromLine = doc.line(p.start + 1);
+    const toLine = doc.line(Math.min(Math.max(last, p.start + 1), doc.lines));
+    if (toLine.to <= fromLine.from) return Decoration.none;
+    return Decoration.set([Decoration.replace({ block: true }).range(fromLine.from, toLine.to)]);
+  };
+  const field = StateField.define({
+    create: (state) => ({ live: isLive(state), deco: build(state) }),
+    update(value, tr) {
+      const live = isLive(tr.state);
+      if (!tr.docChanged && live === value.live) return value;
+      return { live, deco: build(tr.state) };
+    },
+    provide: (f) => [
+      EditorView.decorations.from(f, (v) => v.deco),
+      EditorView.atomicRanges.of((view) => view.state.field(f).deco),
+    ],
+  });
+  return [field];
+}
+
 class CommentSettingTab extends obsidian.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
@@ -2480,6 +2529,7 @@ class NotionStyleKanbanPlugin extends obsidian.Plugin {
     this.comments.load();
     this.register(() => this.comments.unload());
     this.addSettingTab(new CommentSettingTab(this.app, this));
+    this.registerEditorExtension(commentHiderExtension());
 
     this.viewTabs = new ViewTabsBar(this);
     this.viewTabs.load();
