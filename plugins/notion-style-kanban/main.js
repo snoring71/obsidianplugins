@@ -81,6 +81,48 @@ function parseLink(raw) {
   return { linkpath: s, alias: null };
 }
 
+// ---------- display titles ----------
+// Obsidian names a note after its file, and two files in one folder can't share a name, so the
+// Notion importer numbered repeated titles ("Create release planning document 1") and replaced
+// characters files can't hold ("/" became "-"). A note can carry its real title in this property;
+// the board, links, tabs and the note header show it, while the file name stays unique.
+const TITLE_KEY = "title";
+let APP = null;
+
+function titleOf(fm) {
+  const t = fm ? fm[TITLE_KEY] : undefined;
+  if (typeof t === "string") return t.trim();
+  if (typeof t === "number") return String(t);
+  return "";
+}
+
+function displayTitle(file, app) {
+  if (!file) return "";
+  const a = app || APP;
+  const c = a ? a.metadataCache.getFileCache(file) : null;
+  return titleOf(c && c.frontmatter) || file.basename;
+}
+
+// text that is safe inside [[target|text]]
+function linkAlias(text) {
+  return String(text).replace(/\|/g, "-").replace(/\[\[|\]\]/g, "").trim();
+}
+
+// "Name", "Name 1", "Name 12" all count as the file for the title "Name"
+function fileFitsTitle(basename, title) {
+  const want = safeFileName(title || "Untitled");
+  if (basename === want) return true;
+  return basename.startsWith(want + " ") && /^\d+$/.test(basename.slice(want.length + 1));
+}
+
+function uniqueNotePath(app, folder, name) {
+  const pathFor = (nm) => obsidian.normalizePath(`${folder && folder !== "/" ? folder + "/" : ""}${nm}.md`);
+  let target = name;
+  let n = 1;
+  while (app.vault.getAbstractFileByPath(pathFor(target))) target = `${name} ${n++}`;
+  return pathFor(target);
+}
+
 function setIconSafe(el, names) {
   for (const n of names) {
     obsidian.setIcon(el, n);
@@ -231,7 +273,7 @@ class NotionKanbanView extends obsidian.BasesView {
   resolve(raw, sourcePath) {
     const { linkpath, alias } = parseLink(raw);
     const file = this.app.metadataCache.getFirstLinkpathDest(linkpath, sourcePath);
-    const name = alias || (file ? file.basename : linkpath.split("/").pop());
+    const name = file ? displayTitle(file, this.app) : alias || linkpath.split("/").pop();
     return { file, name, linkpath };
   }
 
@@ -414,7 +456,7 @@ class NotionKanbanView extends obsidian.BasesView {
         this.plugin.openIconPicker(c.file, s.iconKey, titleIcon);
       };
     }
-    titleRow.createSpan({ cls: "nk-title", text: c.file.basename });
+    titleRow.createSpan({ cls: "nk-title", text: displayTitle(c.file, this.app) });
 
     // tags
     const tags = s.tagKey ? asList(c.fm[s.tagKey]).map(String) : [];
@@ -656,20 +698,19 @@ class NotionKanbanView extends obsidian.BasesView {
     const sample = entries[0] ? entries[0].file : null;
     const folder = sample && sample.parent ? sample.parent.path : "";
     const sampleFm = sample ? this.fm(sample) : {};
-    let name = "Untitled";
-    let n = 1;
-    const pathFor = (nm) => obsidian.normalizePath(`${folder ? folder + "/" : ""}${nm}.md`);
-    while (this.app.vault.getAbstractFileByPath(pathFor(name))) name = `Untitled ${n++}`;
-    const file = await this.app.vault.create(pathFor(name), "");
+    const file = await this.app.vault.create(uniqueNotePath(this.app, folder, "Untitled"), "");
     await this.app.fileManager.processFrontMatter(file, (fm) => {
+      // an empty title puts the Notion-style title header on the note; typing in it names the task
+      fm[TITLE_KEY] = "";
       // keep the note inside this base's filter (the importer links notes to their base)
       if (sampleFm.base) fm.base = sampleFm.base;
       if (column !== NO_VALUE) fm[s.columnKey] = column;
       if (s.laneKey && lane && lane !== NO_VALUE) fm[s.laneKey] = lane;
       if (s.orderKey) fm[s.orderKey] = 0;
     });
+    this.plugin.focusTitlePath = file.path;
     const leaf = this.app.workspace.getLeaf("tab");
-    await leaf.openFile(file, { state: { mode: "source" }, eState: { rename: "all" } });
+    await leaf.openFile(file, { state: { mode: "source" } });
   }
 }
 
@@ -1036,7 +1077,12 @@ class NoteIconHeader {
 
   unload() {
     if (this.observer) this.observer.disconnect();
-    document.querySelectorAll(".nk-note-icon-wrap").forEach((e) => e.remove());
+    document.querySelectorAll(".nk-note-icon-wrap, .nk-title-header").forEach((e) => e.remove());
+    document.querySelectorAll(".nk-hidden-inline-title").forEach((e) => e.removeClass("nk-hidden-inline-title"));
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const t = leaf.tabHeaderInnerTitleEl;
+      if (t && leaf.view && leaf.view.file) t.setText(leaf.view.file.basename);
+    }
   }
 
   refreshAll() {
@@ -1045,6 +1091,10 @@ class NoteIconHeader {
       const view = leaf.view;
       if (!view || !view.file || !view.containerEl) continue;
       this.renderInView(view);
+      // the tab shows the display title too (Obsidian resets it on rename; this runs again after)
+      const tab = leaf.tabHeaderInnerTitleEl;
+      const want = displayTitle(view.file, this.app);
+      if (tab && tab.textContent !== want) tab.setText(want);
       // watch only the header level (not the note text) so typing doesn't trigger work
       if (this.observer) {
         view.containerEl.querySelectorAll(".markdown-preview-sizer, .cm-sizer").forEach((h) => this.observer.observe(h, { childList: true }));
@@ -1067,6 +1117,7 @@ class NoteIconHeader {
         wrap = createDiv({ cls: "nk-note-icon-wrap" });
         anchorParent.insertBefore(wrap, title || anchorParent.firstChild);
       }
+      this.renderTitle(view, host, title, fm);
       if (wrap.dataset.value === value && wrap.dataset.path === file.path && wrap.childElementCount) return;
       wrap.dataset.value = value;
       wrap.dataset.path = file.path;
@@ -1083,6 +1134,104 @@ class NoteIconHeader {
       }
     });
   }
+
+  // Notes with a `title` property get a Notion-style title in place of Obsidian's inline title
+  // (which shows, and renames, the file). Editing it changes the title; the file follows when it can.
+  renderTitle(view, host, native, fm) {
+    let el = host.querySelector(":scope > .nk-title-header, :scope > .mod-header > .nk-title-header");
+    const on = native && Object.prototype.hasOwnProperty.call(fm, TITLE_KEY);
+    if (!on) {
+      if (el) el.remove();
+      if (native) native.removeClass("nk-hidden-inline-title");
+      return;
+    }
+    native.addClass("nk-hidden-inline-title");
+    if (!el || el.previousElementSibling !== native) {
+      if (el) el.remove();
+      el = createDiv({ cls: "nk-title-header", attr: { contenteditable: "plaintext-only", spellcheck: "false", "data-placeholder": "Untitled" } });
+      native.insertAdjacentElement("afterend", el);
+      this.wireTitle(view, el);
+    }
+    if (el.dataset.editing === "1") return;
+    const text = titleOf(fm) || (fm[TITLE_KEY] === "" || fm[TITLE_KEY] === null ? "" : view.file.basename);
+    if (el.textContent !== text) el.textContent = text;
+    if (this.plugin.focusTitlePath === view.file.path && host.closest(".markdown-source-view") && host.isShown()) {
+      this.plugin.focusTitlePath = null;
+      window.setTimeout(() => {
+        el.focus();
+        const sel = window.getSelection();
+        if (sel) { const r = document.createRange(); r.selectNodeContents(el); sel.removeAllRanges(); sel.addRange(r); }
+      }, 0);
+    }
+  }
+
+  wireTitle(view, el) {
+    let original = "";
+    el.addEventListener("focus", () => { el.dataset.editing = "1"; original = el.textContent; });
+    el.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" || ev.key === "Escape") {
+        ev.preventDefault();
+        if (ev.key === "Escape") el.textContent = original;
+        el.blur();
+        if (view.editor && view.getMode && view.getMode() === "source") view.editor.focus();
+      }
+    });
+    el.addEventListener("paste", (ev) => {
+      // keep it one line of plain text
+      ev.preventDefault();
+      const text = ((ev.clipboardData && ev.clipboardData.getData("text/plain")) || "").replace(/\s+/g, " ");
+      document.execCommand("insertText", false, text);
+    });
+    el.addEventListener("blur", async () => {
+      delete el.dataset.editing;
+      const text = el.textContent.replace(/\s+/g, " ").trim();
+      if (text !== original.replace(/\s+/g, " ").trim() && view.file) await this.plugin.setDisplayTitle(view.file, text);
+      this.refreshSoon();
+    });
+  }
+}
+
+// ---------- Notion titles for imported notes ----------
+
+// Previews, then applies, the real Notion page titles to imported notes whose file names differ
+// (numbered duplicates, "/" turned into "-", dropped date mentions). The titles come from
+// notion-titles.json in the plugin folder: { "<notion page id>": "<title>" }.
+class NotionTitlesModal extends obsidian.Modal {
+  constructor(plugin, plan) {
+    super(plugin.app);
+    this.plugin = plugin;
+    this.plan = plan;
+    this.fixLinks = true;
+  }
+  onOpen() {
+    const { contentEl, plan } = this;
+    this.modalEl.addClass("nk-titles-modal");
+    this.titleEl.setText("Use Notion page titles");
+    contentEl.createEl("p", {
+      text: `${plan.notes.length} imported notes have a file name that differs from their Notion title. ` +
+        "Each gets a title property with the Notion title, which the board, links, tabs and note header show. File names don't change.",
+    });
+    const list = contentEl.createDiv({ cls: "nk-titles-list" });
+    for (const n of plan.notes) {
+      const row = list.createDiv({ cls: "nk-titles-row" });
+      row.createSpan({ cls: "nk-titles-old", text: n.file.path.replace(/\.md$/, "") });
+      row.createSpan({ cls: "nk-titles-arrow", text: "→" });
+      row.createSpan({ cls: "nk-titles-new", text: n.title });
+    }
+    new obsidian.Setting(contentEl)
+      .setName("Also update link labels")
+      .setDesc(`Relabel ${plan.links} links in ${plan.sources} notes (e.g. Sub-task and Parent task) that show the old file name.`)
+      .addToggle((t) => t.setValue(true).onChange((v) => { this.fixLinks = v; }));
+    const row = contentEl.createDiv({ cls: "modal-button-container" });
+    const ok = row.createEl("button", { cls: "mod-cta", text: `Apply to ${plan.notes.length} notes` });
+    ok.onclick = async () => {
+      ok.disabled = true;
+      this.close();
+      await this.plugin.applyNotionTitles(plan, this.fixLinks);
+    };
+    row.createEl("button", { text: "Cancel" }).onclick = () => this.close();
+  }
+  onClose() { this.contentEl.empty(); }
 }
 
 // ---------- Notion-style property options (select / multi-select) ----------
@@ -1154,7 +1303,8 @@ class PropertySchemas {
   visibilityOf(prop) {
     if (!prop) return "always";
     const k = Object.keys(this.visibility).find((n) => sameText(n, prop));
-    return (k && this.visibility[k]) || "always";
+    // the title shows in the note header, so its property row is hidden unless chosen otherwise
+    return (k && this.visibility[k]) || (sameText(prop, TITLE_KEY) ? "hide" : "always");
   }
 
   async setVisibility(prop, mode) {
@@ -2009,7 +2159,7 @@ function expandVars(text, file) {
   return String(text === undefined || text === null ? "" : text).replace(/\{\{\s*([^}]+?)\s*\}\}/g, (all, expr) => {
     const parts = expr.split(":");
     const kind = parts[0].trim().toLowerCase();
-    if (kind === "title") return file ? file.basename : "";
+    if (kind === "title") return file ? displayTitle(file) : "";
     if (kind === "today" || kind === "date") return m().format(parts.slice(1).join(":") || "YYYY-MM-DD");
     if (kind === "next") {
       const spec = (parts[1] || "").trim().toLowerCase();
@@ -2234,7 +2384,7 @@ class NoteButtons {
       await leaf.openFile(c.file, { state: { mode: "source" }, eState: { rename: "all" } });
     } else if (state.created.length) {
       const n = state.created.length;
-      new obsidian.Notice(n === 1 ? `Added "${state.created[0].file.basename}"` : `Added ${n} tasks`);
+      new obsidian.Notice(n === 1 ? `Added "${displayTitle(state.created[0].file)}"` : `Added ${n} tasks`);
     }
   }
 
@@ -2278,7 +2428,7 @@ class NoteButtons {
     return (c && c.frontmatter) || {};
   }
   linkTo(file) {
-    return `[[${file.path.replace(/\.md$/, "")}|${file.basename}]]`;
+    return `[[${file.path.replace(/\.md$/, "")}|${linkAlias(displayTitle(file))}]]`;
   }
   resolve(raw, from) {
     const { linkpath } = parseLink(raw);
@@ -2334,14 +2484,12 @@ class NoteButtons {
     const tpl = await this.readTemplate(tplPath);
     const folder = step.folder ? obsidian.normalizePath(String(step.folder)) : (from.parent ? from.parent.path : "");
     const tplName = tplPath ? String(tplPath).split("/").pop().replace(/\.md$/, "") : "";
-    const base = safeFileName(expandVars(step.name || (asChild ? "Subtask" : tplName || "Untitled"), from));
-    const pathFor = (nm) => obsidian.normalizePath(`${folder && folder !== "/" ? folder + "/" : ""}${nm}.md`);
-    let name = base;
-    let n = 1;
-    while (this.app.vault.getAbstractFileByPath(pathFor(name))) name = `${base} ${n++}`;
-    const note = await this.app.vault.create(pathFor(name), expandVars(tpl.body || "", from));
+    // Notion keeps the title as typed; the file gets a safe, unique name and the title goes in a property
+    const title = expandVars(step.name || (asChild ? "Subtask" : tplName || "Untitled"), from).replace(/\s+/g, " ").trim() || "Untitled";
+    const note = await this.app.vault.create(uniqueNotePath(this.app, folder, safeFileName(title)), expandVars(tpl.body || "", from));
     await this.app.fileManager.processFrontMatter(note, (fm) => {
       for (const [k, v] of Object.entries(tpl.fm)) if (!TEMPLATE_SKIP_KEYS.has(k)) fm[k] = v;
+      fm[TITLE_KEY] = title;
       if (fromFm.base) fm.base = fromFm.base;
       if (asChild) fm[cfg.parentProperty] = [this.linkTo(from)];
       for (const [k, v] of Object.entries(step.properties || {})) fm[k] = typeof v === "string" ? expandVars(v, from) : v;
@@ -2375,7 +2523,7 @@ class NoteButtons {
         if (cfg.completedProperty) fm[cfg.completedProperty] = this.withLink(fm[cfg.completedProperty], child, p);
       });
     }
-    new obsidian.Notice(parents.length ? `Moved to Completed Tasks of "${parents.map((p) => p.basename).join('", "')}"` : `Set to ${status} (no parent task)`);
+    new obsidian.Notice(parents.length ? `Moved to Completed Tasks of "${parents.map((p) => displayTitle(p)).join('", "')}"` : `Set to ${status} (no parent task)`);
   }
 
   // Notion: Sub-task -= all (the two-way relation clears each child's Parent task)
@@ -2392,7 +2540,7 @@ class NoteButtons {
 
   matches(file, fm, rule) {
     const prop = String(rule.property || "");
-    const raw = prop === "file.name" || prop.toLowerCase() === "name" ? file.basename : fm[prop];
+    const raw = prop === "file.name" || prop.toLowerCase() === "name" ? displayTitle(file) : fm[prop];
     const vals = asList(raw).map((v) => {
       const s = asString(v);
       const l = parseLink(s);
@@ -2468,13 +2616,7 @@ class NoteButtons {
   }
 
   async renameNote(step, file) {
-    const name = safeFileName(expandVars(step.name || file.basename, file));
-    if (name === file.basename) return;
-    const dir = file.parent && file.parent.path !== "/" ? file.parent.path + "/" : "";
-    let target = name;
-    let n = 1;
-    while (this.app.vault.getAbstractFileByPath(obsidian.normalizePath(`${dir}${target}.md`))) target = `${name} ${n++}`;
-    await this.app.fileManager.renameFile(file, obsidian.normalizePath(`${dir}${target}.md`));
+    await this.plugin.setDisplayTitle(file, expandVars(step.name || displayTitle(file), file));
   }
 
   // Notion: "Insert blocks above/below button"
@@ -3109,6 +3251,118 @@ class CommentSettingTab extends obsidian.PluginSettingTab {
 }
 
 class NotionStyleKanbanPlugin extends obsidian.Plugin {
+  // ----- display titles -----
+
+  async setDisplayTitle(file, raw) {
+    const title = String(raw === undefined || raw === null ? "" : raw).replace(/\s+/g, " ").trim();
+    const fm = (this.app.metadataCache.getFileCache(file) || {}).frontmatter || {};
+    const had = Object.prototype.hasOwnProperty.call(fm, TITLE_KEY);
+    const oldLabels = [file.basename, titleOf(fm)].filter(Boolean);
+    if (!(had && titleOf(fm) === title)) {
+      await this.app.fileManager.processFrontMatter(file, (f) => { f[TITLE_KEY] = title; });
+    }
+    // relabel links first, while they still point at the current file name
+    await this.retitleLinks([{ file, title: title || file.basename, oldLabels }]);
+    // keep the file name close to the title, numbered only when another note already has it
+    if (title && !fileFitsTitle(file.basename, title)) {
+      const folder = file.parent ? file.parent.path : "";
+      try {
+        await this.app.fileManager.renameFile(file, uniqueNotePath(this.app, folder, safeFileName(title)));
+      } catch (e) {
+        console.warn("Notion-style Kanban: rename failed", e);
+      }
+    }
+  }
+
+  // Links whose label is the file name (or another old label) get the new title as their label.
+  // targets: [{ file, title, oldLabels? }]. Returns { links, sources } when dryRun.
+  async retitleLinks(targets, dryRun) {
+    const byPath = new Map(targets.map((t) => [t.file.path, t]));
+    const edits = new Map(); // source path -> [[original, replacement]]
+    let links = 0;
+    const resolved = this.app.metadataCache.resolvedLinks || {};
+    for (const src of Object.keys(resolved)) {
+      const dests = resolved[src];
+      if (!Object.keys(dests).some((d) => byPath.has(d))) continue;
+      const cache = this.app.metadataCache.getCache(src);
+      if (!cache) continue;
+      for (const l of [...(cache.frontmatterLinks || []), ...(cache.links || [])]) {
+        const dest = this.app.metadataCache.getFirstLinkpathDest(obsidian.getLinkpath(l.link), src);
+        const t = dest && byPath.get(dest.path);
+        if (!t) continue;
+        const label = l.displayText !== undefined ? l.displayText : "";
+        const linkName = obsidian.getLinkpath(l.link).split("/").pop();
+        const old = new Set([t.file.basename, linkName, ...(t.oldLabels || [])]);
+        const alias = linkAlias(t.title);
+        if (!old.has(label) || label === alias || !l.original.startsWith("[[")) continue;
+        const rep = `[[${l.link}|${alias}]]`;
+        if (!edits.has(src)) edits.set(src, []);
+        edits.get(src).push([l.original, rep]);
+        links++;
+      }
+    }
+    if (dryRun) return { links, sources: edits.size };
+    for (const [src, pairs] of edits) {
+      const f = this.app.vault.getFileByPath(src);
+      if (!f) continue;
+      await this.app.vault.process(f, (data) => {
+        // only touch the link text itself, in the frontmatter and the body alike
+        let out = data;
+        for (const [a, b] of pairs) out = out.split(a).join(b);
+        return out;
+      });
+    }
+    return { links, sources: edits.size };
+  }
+
+  async loadNotionTitles() {
+    const path = obsidian.normalizePath(`${this.manifest.dir}/notion-titles.json`);
+    if (!(await this.app.vault.adapter.exists(path))) return null;
+    try {
+      return JSON.parse(await this.app.vault.adapter.read(path));
+    } catch (e) {
+      new obsidian.Notice("notion-titles.json couldn't be read: " + e.message);
+      return null;
+    }
+  }
+
+  async planNotionTitles() {
+    const map = await this.loadNotionTitles();
+    if (!map) {
+      new obsidian.Notice("No Notion titles found. Put notion-titles.json in the plugin folder first.");
+      return null;
+    }
+    const norm = (id) => String(id || "").replace(/-/g, "").toLowerCase();
+    const titles = new Map(Object.entries(map).map(([k, v]) => [norm(k), String(v).replace(/\s+/g, " ").trim()]));
+    const notes = [];
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      const fm = (this.app.metadataCache.getFileCache(file) || {}).frontmatter;
+      if (!fm || !fm["notion-id"] || Object.prototype.hasOwnProperty.call(fm, TITLE_KEY)) continue;
+      const title = titles.get(norm(fm["notion-id"]));
+      if (!title || title === file.basename) continue;
+      notes.push({ file, title });
+    }
+    notes.sort((a, b) => a.file.path.localeCompare(b.file.path));
+    const counts = await this.retitleLinks(notes, true);
+    return { notes, links: counts.links, sources: counts.sources };
+  }
+
+  async applyNotionTitles(plan, fixLinks) {
+    const notice = new obsidian.Notice(`Setting titles on ${plan.notes.length} notes…`, 0);
+    let done = 0;
+    for (const n of plan.notes) {
+      await this.app.fileManager.processFrontMatter(n.file, (fm) => { fm[TITLE_KEY] = n.title; });
+      if (++done % 50 === 0) notice.setMessage(`Setting titles… ${done} of ${plan.notes.length}`);
+    }
+    let links = { links: 0, sources: 0 };
+    if (fixLinks) {
+      notice.setMessage("Updating link labels…");
+      links = await this.retitleLinks(plan.notes);
+    }
+    notice.hide();
+    new obsidian.Notice(`Titles set on ${done} notes` + (fixLinks ? `, ${links.links} links relabeled in ${links.sources} notes.` : "."));
+  }
+
   openOptions(file, prop, anchorEl) {
     if (this.activeOptions) this.activeOptions.close();
     this.activeOptions = new OptionsPopover(this, file, prop, anchorEl);
@@ -3133,6 +3387,7 @@ class NotionStyleKanbanPlugin extends obsidian.Plugin {
   }
 
   async onload() {
+    APP = this.app;
     this.settings = Object.assign({ recentIcons: [], savedIcons: [], pickerTab: null }, (await this.loadData()) || {});
     this.settings.recentIcons = this.settings.recentIcons.slice(0, RECENT_LIMIT);
     this.registerHoverLinkSource(HOVER_SOURCE, { display: "Notion-style Kanban", defaultMod: true });
@@ -3158,6 +3413,35 @@ class NotionStyleKanbanPlugin extends obsidian.Plugin {
 
     this.noteButtons = new NoteButtons(this);
     this.noteButtons.load();
+
+    this.addCommand({
+      id: "apply-notion-titles",
+      name: "Use Notion page titles for imported notes",
+      callback: async () => {
+        const plan = await this.planNotionTitles();
+        if (!plan) return;
+        if (!plan.notes.length) return new obsidian.Notice("Every imported note already shows its Notion title.");
+        new NotionTitlesModal(this, plan).open();
+      },
+    });
+    this.addCommand({
+      id: "set-display-title",
+      name: "Edit title of current note",
+      checkCallback: (checking) => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file || file.extension !== "md") return false;
+        if (!checking) {
+          const fm = (this.app.metadataCache.getFileCache(file) || {}).frontmatter || {};
+          const go = async () => {
+            if (!Object.prototype.hasOwnProperty.call(fm, TITLE_KEY)) await this.setDisplayTitle(file, displayTitle(file));
+            this.focusTitlePath = file.path;
+            this.noteIcons.refreshSoon();
+          };
+          go();
+        }
+        return true;
+      },
+    });
 
     // "Change icon" on any note's right-click menu (cards, sub-tasks, file explorer, tabs)
     let lastMouse = null;
