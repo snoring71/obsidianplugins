@@ -2100,21 +2100,49 @@ const FILTER_OPS = [
 ];
 
 const RP = "Templates/RM Tasks/RP - ";
+const tagButtons = (tag, icon) => [
+  { label: `Add "${tag}" tag`, icon: icon || "tag", steps: [{ action: "edit-properties", changes: [{ property: "Tag", mode: "add", value: tag }] }] },
+  { label: `Remove "${tag}" tag`, icon: "x", steps: [{ action: "edit-properties", changes: [{ property: "Tag", mode: "remove", value: tag }] }] },
+];
+const holderButton = (tag) => ({
+  label: `Create new "${tag}" holder task`,
+  icon: "clock",
+  confirm: "Are you sure you want to create a new task? Please confirm that an open task does not already exist.",
+  steps: [{ action: "add-task", template: `Templates/RM Tasks/${tag}.md`, open: "tab" }],
+});
+const adoptButton = (tag) => ({
+  label: `Add tasks with "${tag}" tag as sub-tasks`,
+  icon: "filter",
+  steps: [{
+    action: "adopt-matching",
+    where: [
+      { property: "Tag", op: "contains", value: tag },
+      { property: "Status", op: "is-any", value: "Not started, Up next, In progress" },
+      { property: "Parent task", op: "is-empty" },
+      // Notion: Name is not "<tag>". Obsidian numbers repeat names ("… 1"), so match the start.
+      { property: "file.name", op: "not-starts-with", value: tag },
+    ],
+  }],
+});
+const SET_DONE = { label: "Set this item's status to Done", icon: "check", steps: [{ action: "edit-properties", changes: [{ property: "Status", mode: "set", value: "Done" }] }] };
+const nestedBlock = (btn) => buttonBlock(normalizeButton(btn)).replace(/\n$/, "").split("\n").map((l) => "\t" + l).join("\n");
+
+// The buttons on the RM Tasks templates in Notion (read 2026-11-27)
 const BUILTIN_BUTTONS = [
   { label: "Add subtask", icon: "plus", steps: [{ action: "add-subtask", name: "Subtask", template: DEFAULT_SUBTASK_TEMPLATE }] },
-  { label: "Move to Completed Tasks and set to Closed", icon: "check-square", steps: [{ action: "complete-subtask", status: "Closed" }] },
-  { label: "Un-parent all sub-tasks", icon: "unlink", steps: [{ action: "unparent-all" }] },
   {
-    label: "Add standard test item tasks",
-    icon: "list-checks",
-    steps: [{ action: "insert", position: "above", text: "- [ ] Test in .local\n- [ ] Enter CCB\n- [ ] Deploy to 1x/2x\n- [ ] Update BCM" }],
+    label: "Move to Completed Tasks and set to Closed",
+    icon: "check-square",
+    steps: [{ action: "complete-subtask", status: "Closed" }],
   },
+  SET_DONE,
   {
     label: "Create release planning subtasks",
     icon: "calendar-plus",
     confirm: "Are you sure you want to create sub-tasks?",
     steps: [
       { action: "add-subtask", name: "Create RM work item and SPR", template: RP + "Create RM work item and SPR.md", open: "none" },
+      { action: "add-subtask", name: "Request documentation and approval", template: RP + "Request documentation and approval.md", open: "none" },
       { action: "add-subtask", name: "Get initial list of candidate sites", template: RP + "Get initial list of candidate sites.md", open: "none" },
       { action: "add-subtask", name: "Create release planning document", template: RP + "Create release planning document.md", open: "none" },
       { action: "add-subtask", name: "Schedule release planning meeting", template: RP + "Schedule release planning meeting.md", open: "none" },
@@ -2122,29 +2150,40 @@ const BUILTIN_BUTTONS = [
     ],
   },
   {
-    label: "Create new \"Waiting for CCB meeting\" holder task",
-    icon: "clock",
-    confirm: "Are you sure you want to create a new task? Please confirm that an open task does not already exist.",
-    steps: [{ action: "add-task", name: "Waiting for CCB meeting", template: "Templates/RM Tasks/Waiting for CCB meeting.md", open: "tab" }],
+    label: "Create product development lifecycle meeting sub-tasks",
+    icon: "calendar-plus",
+    confirm: "Are you sure you want to create sub-tasks?",
+    confirmText: "Yes",
+    steps: [
+      { action: "add-subtask", name: "Meeting preparation tasks", template: "Templates/RM Tasks/PDLC meeting - prep.md", open: "none" },
+      { action: "add-subtask", name: "Meeting follow-up tasks", template: "Templates/RM Tasks/PDLC post-meeting follow-up.md", open: "none" },
+    ],
+  },
+  holderButton("Waiting for CCB meeting"),
+  holderButton("Waiting to update BCM"),
+  adoptButton("Waiting for CCB meeting"),
+  adoptButton("Waiting to update BCM"),
+  { label: "Un-parent all sub-tasks", icon: "unlink", steps: [{ action: "unparent-all" }] },
+  null, // "Add standard tasks", filled in below (it contains buttons)
+  ...tagButtons("Waiting for CCB meeting"),
+  ...tagButtons("Waiting for feedback"),
+  ...tagButtons("Waiting on dev work"),
+  ...tagButtons("Waiting on testing"),
+  {
+    label: "Add \"Waiting on testing\" tag and move to backlog",
+    icon: "archive",
+    steps: [{ action: "edit-properties", changes: [{ property: "Tag", mode: "add", value: "Waiting on testing" }, { property: "Team", mode: "set", value: "General Backlog" }] }],
   },
   {
-    label: "Add tasks with \"Waiting for CCB meeting\" tag as sub-tasks",
-    icon: "filter",
-    steps: [{
-      action: "adopt-matching",
-      where: [
-        { property: "Tag", op: "contains", value: "Waiting for CCB meeting" },
-        { property: "Status", op: "is-any", value: "Not started, Up next, In progress" },
-        { property: "Parent task", op: "is-empty" },
-        { property: "file.name", op: "not-starts-with", value: "Waiting for CCB meeting" },
-      ],
-    }],
+    label: "Remove \"Waiting on testing\" tag and move out of backlog",
+    icon: "archive-restore",
+    steps: [{ action: "edit-properties", changes: [{ property: "Tag", mode: "remove", value: "Waiting on testing" }, { property: "Team", mode: "set", value: "Release Management" }] }],
   },
-  { label: "Add \"Waiting for CCB meeting\" tag", icon: "tag", steps: [{ action: "edit-properties", changes: [{ property: "Tag", mode: "add", value: "Waiting for CCB meeting" }] }] },
-  { label: "Remove \"Waiting for CCB meeting\" tag", icon: "x", steps: [{ action: "edit-properties", changes: [{ property: "Tag", mode: "remove", value: "Waiting for CCB meeting" }] }] },
-  { label: "Set Future tag and Date to next meeting", icon: "calendar", description: "Notes Database: renames to 1-1 Meeting <next Wednesday>", steps: [{ action: "rename", name: "1-1 Meeting {{next:wednesday:MM-DD-YYYY}}" }] },
-  { label: "Set Future tag and Date to next meeting (meeting is next Tuesday)", icon: "calendar", description: "Notes Database: renames to 1-1 Meeting <next Tuesday>", steps: [{ action: "rename", name: "1-1 Meeting {{next:tuesday:MM-DD-YYYY}}" }] },
-  { label: "Set Future tag and Date to next meeting (meeting is next next Tuesday)", icon: "calendar", description: "Notes Database: renames to 1-1 Meeting <the Tuesday after next>", steps: [{ action: "rename", name: "1-1 Meeting {{next:tuesday+1:MM-DD-YYYY}}" }] },
+  {
+    label: "Two week reminder and move to General Backlog",
+    icon: "alarm-clock",
+    steps: [{ action: "edit-properties", changes: [{ property: "Reminder Date", mode: "set", value: "{{today+14:YYYY-MM-DD}}T09:00" }, { property: "Team", mode: "set", value: "General Backlog" }] }],
+  },
 ];
 
 const WEEKDAYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
@@ -2160,7 +2199,8 @@ function expandVars(text, file) {
     const parts = expr.split(":");
     const kind = parts[0].trim().toLowerCase();
     if (kind === "title") return file ? displayTitle(file) : "";
-    if (kind === "today" || kind === "date") return m().format(parts.slice(1).join(":") || "YYYY-MM-DD");
+    const rel = kind.match(/^(today|date)([+-]\d+)?$/);
+    if (rel) return m().add(Number(rel[2] || 0), "days").format(parts.slice(1).join(":") || "YYYY-MM-DD");
     if (kind === "next") {
       const spec = (parts[1] || "").trim().toLowerCase();
       const mm = spec.match(/^([a-z]+)(?:\+(\d+))?$/);
@@ -2200,6 +2240,7 @@ function buttonToYaml(btn) {
   if (btn.icon) out.icon = btn.icon;
   if (btn.description) out.description = btn.description;
   if (btn.confirm) out.confirm = btn.confirm;
+  if (btn.confirm && btn.confirmText && btn.confirmText !== "Continue") out.confirmText = btn.confirmText;
   for (const k of BUTTON_KEYS) if (btn[k] && btn[k] !== BUTTON_DEFAULTS[k]) out[k] = btn[k];
   out.steps = (btn.steps || []).map((s) => {
     const o = { action: s.action };
@@ -2216,6 +2257,29 @@ function buttonToYaml(btn) {
 
 function buttonBlock(btn) {
   return "```notion-button\n" + buttonToYaml(btn) + "\n```\n";
+}
+
+function standardTasksButton() {
+  const ccb = tagButtons("Waiting for CCB meeting");
+  return {
+    label: "Add standard tasks",
+    icon: "list-checks",
+    steps: [{
+      action: "insert",
+      position: "top",
+      text: [
+        "- [ ] Test in .local",
+        "- [ ] Enter CCB",
+        nestedBlock(ccb[0]),
+        "- [ ] Confirm that CCB is approved",
+        nestedBlock(ccb[1]),
+        "- [ ] Deploy to 1x/2x",
+        "- [ ] Update BCM",
+        "- [ ] Close item on RM board",
+        nestedBlock(Object.assign({}, SET_DONE, { label: "Set Status to Done" })),
+      ].join("\n"),
+    }],
+  };
 }
 
 class NoteButtons {
@@ -2262,6 +2326,8 @@ class NoteButtons {
   // ----- library -----
 
   library() {
+    const i = BUILTIN_BUTTONS.indexOf(null);
+    if (i >= 0) BUILTIN_BUTTONS[i] = standardTasksButton();
     const mine = asList(this.plugin.settings.buttonLibrary).filter((b) => b && typeof b === "object" && b.label);
     return { builtin: BUILTIN_BUTTONS, mine };
   }
@@ -2624,11 +2690,25 @@ class NoteButtons {
     const text = expandVars(step.text || "", file).replace(/\s+$/, "");
     if (!text) return;
     const info = ctx && el ? ctx.getSectionInfo(el) : null;
-    const below = String(step.position || "above").toLowerCase() === "below";
+    const pos = String(step.position || "above").toLowerCase();
+    const below = pos === "below";
     await this.app.vault.process(file, (data) => {
       const nl = data.includes("\r\n") ? "\r\n" : "\n";
       const lines = data.split(/\r?\n/);
       const add = text.split(/\r?\n/);
+      if (pos === "top") {
+        // Notion: "top of page" = right under the properties (and under the comments section)
+        let at = 0;
+        if (lines[0] === "---") { const end = lines.indexOf("---", 1); if (end > 0) at = end + 1; }
+        let k = at;
+        while (k < lines.length && !lines[k].trim()) k++;
+        if ((lines[k] || "").includes("notion-comments:start")) {
+          const end = lines.findIndex((l, j) => j > k && l.includes("notion-comments:end"));
+          if (end > 0) at = end + 1;
+        }
+        lines.splice(at, 0, ...(at > 0 && lines[at - 1].trim() && lines[at - 1] !== "---" ? [""] : []), ...add, "");
+        return lines.join(nl);
+      }
       if (!info) return data.replace(/\s*$/, "") + nl + add.join(nl) + nl;
       const at = below ? info.lineEnd + 1 : info.lineStart;
       lines.splice(at, 0, ...add);
@@ -2703,6 +2783,7 @@ class ButtonBuilderModal extends obsidian.Modal {
       icon: start.icon || "",
       description: start.description || "",
       confirm: start.confirm || "",
+      confirmText: start.confirmText || "",
       steps: (start.steps || []).map((s) => Object.assign({}, s)),
     };
     for (const k of BUTTON_KEYS) if (start[k] && start[k] !== BUTTON_DEFAULTS[k]) this.btn[k] = start[k];
@@ -2745,6 +2826,7 @@ class ButtonBuilderModal extends obsidian.Modal {
       .addToggle((t) => t.setValue(!!b.confirm).onChange((v) => { b.confirm = v ? (b.confirm || "Are you sure?") : ""; this.draw(); }));
     if (b.confirm) {
       new obsidian.Setting(confirmCard).setName("Confirmation message").addText((t) => t.setValue(b.confirm).onChange((v) => { b.confirm = v || "Are you sure?"; }));
+      new obsidian.Setting(confirmCard).setName("Continue button text").addText((t) => t.setPlaceholder("Continue").setValue(b.confirmText || "").onChange((v) => { b.confirmText = v.trim(); }));
     }
 
     b.steps.forEach((step, i) => this.drawStep(c, step, i));
@@ -2911,6 +2993,7 @@ class ButtonBuilderModal extends obsidian.Modal {
         new obsidian.Setting(card).setName("Where").addDropdown((d) => d
           .addOption("above", "Above the button")
           .addOption("below", "Below the button")
+          .addOption("top", "Top of the page")
           .setValue(step.position || "above")
           .onChange((v) => { step.position = v; }));
         break;
