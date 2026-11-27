@@ -1,4 +1,4 @@
-# Notion-style buttons (0.14.0)
+# Notion-style buttons (0.15.0)
 
 Notion buttons don't survive the import (the API reports them only as "unknown block"), so the plugin adds its own. A button is a `notion-button` code block in a note. You rarely need to write one by hand.
 
@@ -27,6 +27,11 @@ These are the buttons on the RM Tasks templates in Notion (read 2026-11-27), whi
 | Add / Remove tag: "Waiting for CCB meeting", "Waiting for feedback", "Waiting on dev work", "Waiting on testing" | Chef, Azul, Eyecon, RM Install Request, iOS | Adds or removes that Tag |
 | Add "Waiting on testing" tag and move to backlog / Remove … and move out of backlog | New iOS release review/testing | Tag plus Team = General Backlog, or Team = Release Management |
 | Two week reminder and move to General Backlog | Azul Zulu JRE | Reminder Date = 14 days from today at 9:00 AM, Team = General Backlog |
+| Add "Needs transcription" tag and set status to "Needs work" | Notes Database templates | Sub-topic = Needs transcription, Status = Needs work |
+| Add today's date to title | Notes Database templates | Title becomes "<title> MM/DD/YYYY" |
+| Set Future status and Date to next meeting | RM Standup | Status = Future, Date = the next Tuesday or Thursday after today, title "RM Standup MM/DD/YYYY" |
+| Set Future tag and Date to next meeting (meeting is next Tuesday or today / next next Tuesday) | 1-1 Meeting | Status = Future, Date = the coming Tuesday (or the one after), title "1-1 Meeting MM/DD/YYYY" |
+| Mark as Done and update Last Backup Date(s) | Scheduled FreeFileSync / Steam Deck Backup | Status = Done, Date Completed = now, then sets Last Backup Date = now on the matching Backup Strategy rows (FreeFileSync rows with Backup Status "Done (Manual)", or the Steam Deck SD Card row) |
 
 ## Actions (steps)
 
@@ -38,7 +43,8 @@ These are the buttons on the RM Tasks templates in Notion (read 2026-11-27), whi
 | `unparent-all` | Edit This page: Sub-task remove all | none |
 | `adopt-matching` | Edit tasks that match filters: Parent task = This page | `where`: a list of `{property, op, value}`. Ops: contains, not-contains, is, is-not, is-any (comma separated), starts-with, not-starts-with, is-empty, not-empty. `file.name` is the note's name. Only searches notes in the same base as this page |
 | `edit-properties` | Edit This page | `changes`: a list of `{property, mode, value}` with mode set, add, remove or clear |
-| `rename` | Edit This page: Name | `name` |
+| `edit-matching` | Edit pages in another database that match filters | `base` (e.g. `Backup Strategy.base`), `where` (as in adopt-matching), `changes` (as in edit-properties). Variables like `{{title}}` refer to the page with the button |
+| `rename` | Edit This page: Name | `name` (sets the `title` property, so `/` is fine here) |
 | `insert` | Insert blocks | `text`, `position` (`above`, `below`, or `top` = under the properties and comments) |
 
 A button can also have `confirm: <message>` (Notion's "Show confirmation"), `confirmText` for its Continue button, and `icon`.
@@ -51,9 +57,11 @@ Names, text and property values can use:
 
 - `{{title}}`: this page's name
 - `{{today}}` or `{{today:MM-DD-YYYY}}`, `{{today+14:YYYY-MM-DD}}` for 14 days from today
-- `{{next:tuesday:MM-DD-YYYY}}`: the coming Tuesday (today counts, like Notion's formula), `{{next:tuesday+1:…}}` the week after
+- `{{now}}` or `{{now:YYYY-MM-DDTHH:mm}}`: date and time, `{{time}}` for HH:mm
+- `{{next:tuesday:MM-DD-YYYY}}`: the coming Tuesday (today counts, like Notion's formula), `{{next:tuesday+1:…}}` the week after. Several days are allowed: `{{next:tue,thu}}`
+- `{{after:tue,thu:YYYY-MM-DD}}`: like `next`, but today never counts
 
-File names can't contain `/`, so dates use dashes.
+Variables inside a template's buttons are left alone when a note is made from the template, so `{{today}}` in a button means the day it's clicked.
 
 ## Example block
 
@@ -80,4 +88,4 @@ The older one-action form (`action: add-subtask` at the top level) still works.
 
 ## Templates
 
-`docs/templates/` holds the templates copied into the vault's `Templates/RM Tasks/`: RM Sub-task, the six RP sub-tasks, the two PDLC meeting sub-tasks, and the Waiting for CCB meeting / Waiting to update BCM holders, converted from the Notion templates. They have no `base` property, so they stay out of the RM Tasks base.
+See [templates.md](templates.md) for database templates, the New menu and repeats. `docs/templates/RM Tasks/` holds the templates copied into the vault's `Templates/RM Tasks/`: RM Sub-task, the six RP sub-tasks, the two PDLC meeting sub-tasks, and the Waiting for CCB meeting / Waiting to update BCM holders, converted from the Notion templates. They have no `base` property, so they stay out of the RM Tasks base.

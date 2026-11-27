@@ -411,6 +411,104 @@
 .nk-view-tab-icon svg { width: 16px; height: 16px; }
 .nk-view-tab-more { color: var(--text-faint); }
 
+/* ---------- Notion-style "New ▾" button and templates ---------- */
+.nk-new-button {
+  order: 99;
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 0;
+  position: sticky;
+  right: 0;
+  background: var(--background-primary);
+  padding-left: 8px;
+}
+.nk-view-tabs-only-new { border-bottom: none; }
+.nk-new-button button {
+  height: 28px;
+  font-size: 14px;
+  font-weight: 500;
+  box-shadow: none;
+}
+.nk-new-main { border-radius: 6px 0 0 6px; padding: 0 10px; }
+.nk-new-arrow {
+  border-radius: 0 6px 6px 0;
+  padding: 0 6px;
+  margin-left: 1px;
+}
+.nk-new-arrow svg { width: 14px; height: 14px; }
+.nk-tpl-suggestion { display: flex; align-items: center; gap: 10px; }
+.nk-tpl-suggestion-icon,
+.nk-tpl-row-icon { display: inline-flex; width: 18px; height: 18px; align-items: center; justify-content: center; flex: none; }
+.nk-tpl-suggestion-icon svg,
+.nk-tpl-row-icon svg { width: 16px; height: 16px; }
+.nk-tpl-suggestion-sub { font-size: var(--font-ui-smaller); color: var(--text-muted); }
+.nk-tpl-manager { width: min(760px, 95vw); }
+.nk-tpl-row .setting-item-name { display: flex; align-items: center; gap: 8px; }
+.nk-tpl-badge {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(var(--nk-rgb-blue, 35, 131, 226), 0.2);
+  color: var(--text-accent);
+}
+.nk-tpl-empty { color: var(--text-muted); padding: 12px 0; }
+.nk-tpl-row { position: relative; }
+.nk-tpl-grip {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; margin-right: 6px; flex: none;
+  color: var(--text-faint); cursor: grab; touch-action: none;
+}
+.nk-tpl-grip svg { width: 16px; height: 16px; }
+.nk-tpl-grip:hover { color: var(--text-muted); }
+.nk-tpl-dragging { opacity: 0.5; }
+.nk-tpl-dragging .nk-tpl-grip { cursor: grabbing; }
+.nk-tpl-drop-before { box-shadow: inset 0 2px 0 var(--interactive-accent); }
+.nk-tpl-drop-after { box-shadow: inset 0 -2px 0 var(--interactive-accent); }
+.nk-tpl-row .setting-item-description div + div { margin-top: 2px; }
+.nk-tpl-repeat-on, .nk-tpl-repeat-on:hover { color: var(--color-blue); }
+.nk-tpl-repeat-line { color: var(--color-blue); }
+
+/* "You're editing a template" banner (sits between the tab header and the scrolling note) */
+.nk-tpl-banner {
+  flex: none;
+  background: rgba(var(--color-yellow-rgb), 0.22);
+  color: var(--color-yellow);
+  border-bottom: 1px solid rgba(var(--color-yellow-rgb), 0.3);
+  font-size: var(--font-ui-small);
+}
+.nk-tpl-banner-inner {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: center;
+  gap: 8px; padding: 8px 16px;
+}
+.nk-tpl-banner-db {
+  display: inline-flex; align-items: center; gap: 4px;
+  color: inherit; text-decoration: underline; text-decoration-color: rgba(var(--color-yellow-rgb), 0.5);
+  text-underline-offset: 3px;
+}
+.nk-tpl-banner-db:hover { color: inherit; text-decoration-color: currentColor; }
+.nk-tpl-banner-db-icon, .nk-tpl-banner-help, .nk-tpl-banner-repeat-icon, .nk-tpl-banner-chevron { display: inline-flex; }
+.nk-tpl-banner svg { width: 15px; height: 15px; }
+.nk-tpl-banner-help { opacity: 0.8; cursor: help; }
+.nk-tpl-banner-badge {
+  font-size: 11px; padding: 1px 6px; border-radius: 4px;
+  background: rgba(var(--color-yellow-rgb), 0.25);
+}
+.nk-tpl-banner-repeat {
+  display: inline-flex; align-items: center; gap: 6px;
+  margin-left: 12px; height: auto; padding: 4px 10px;
+  background: transparent; box-shadow: none;
+  color: inherit; font-size: inherit;
+  border: 1px solid rgba(var(--color-yellow-rgb), 0.6); border-radius: 6px;
+  cursor: pointer;
+}
+.nk-tpl-banner-repeat:hover { background: rgba(var(--color-yellow-rgb), 0.15); }
+.nk-tpl-banner-repeat:not(.is-on) .nk-tpl-banner-repeat-icon { opacity: 0.8; }
+.nk-repeat-days { display: flex; flex-wrap: wrap; gap: 4px; }
+.nk-repeat-days button { padding: 0 8px; min-width: 42px; }
+.nk-repeat-preview { color: var(--text-muted); font-size: var(--font-ui-small); padding: 8px 0; }
+.nk-repeat-preview ul { margin: 4px 0 0; padding-left: 20px; }
+
 /* ---------- Notion-style select / multi-select properties ---------- */
 .nk-pill {
   display: inline-flex;

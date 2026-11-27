@@ -694,6 +694,18 @@ class NotionKanbanView extends obsidian.BasesView {
 
   async createCard(column, lane) {
     const s = this.s;
+    // Notion: + on a board column uses the database's default template
+    const lib = this.plugin.templates;
+    const baseFile = this.boardBaseFile();
+    const db = lib && baseFile ? lib.dbForBase(baseFile) : null;
+    const def = db ? lib.defaultTemplate(db) : null;
+    if (def) {
+      const props = {};
+      if (column !== NO_VALUE) props[s.columnKey] = column;
+      if (s.laneKey && lane && lane !== NO_VALUE) props[s.laneKey] = lane;
+      if (s.orderKey) props[s.orderKey] = 0;
+      return lib.guard(() => lib.create(db, def, { properties: props }));
+    }
     const entries = ((this.data && this.data.data) || []).filter((e) => e && e.file instanceof obsidian.TFile);
     const sample = entries[0] ? entries[0].file : null;
     const folder = sample && sample.parent ? sample.parent.path : "";
@@ -715,6 +727,19 @@ class NotionKanbanView extends obsidian.BasesView {
 }
 
 // ---------- plugin ----------
+
+// the .base file a board belongs to (the leaf whose container holds this view)
+NotionKanbanView.prototype.boardBaseFile = function () {
+  for (const leaf of this.app.workspace.getLeavesOfType("bases")) {
+    const v = leaf.view;
+    if (v && v.containerEl && this.containerEl && v.containerEl.contains(this.containerEl) && v.file) return v.file;
+  }
+  // embedded or unknown: fall back to the base linked from the board's notes
+  const e = ((this.data && this.data.data) || []).find((x) => x && x.file instanceof obsidian.TFile);
+  if (!e) return null;
+  const link = parseLink(asString(this.fm(e.file).base)).linkpath;
+  return link ? this.app.metadataCache.getFirstLinkpathDest(link, e.file.path) : null;
+};
 
 function viewOptions() {
   return [
@@ -1972,7 +1997,9 @@ class ViewTabsBar {
     const current = state.viewName || (views[0] && views[0].name) || "";
     const conf = this.settings();
     const hidden = new Set((conf[file.path] && conf[file.path].hidden) || []);
-    const sig = JSON.stringify([file.path, current, views, [...hidden], views.map((v) => conf[this.key(file.path, v.name)] || "")]);
+    const db = this.plugin.templates ? this.plugin.templates.dbForBase(file) : null;
+    const tpls = db ? this.plugin.templates.templates(db).map((t) => [t.name, t.isDefault, !!t.repeat]) : [];
+    const sig = JSON.stringify([file.path, current, views, [...hidden], views.map((v) => conf[this.key(file.path, v.name)] || ""), tpls]);
 
     let bar = content.querySelector(":scope > .nk-view-tabs");
     if (!bar || content.firstElementChild !== bar) {
@@ -1985,10 +2012,12 @@ class ViewTabsBar {
     if (bar.dataset.sig === sig) return;
     bar.dataset.sig = sig;
     bar.empty();
-    if (views.length < 2) { bar.hide(); return; }
+    // the tab bar shows with two or more views; the New button always shows
+    if (views.length < 2) bar.addClass("nk-view-tabs-only-new"); else bar.removeClass("nk-view-tabs-only-new");
     bar.show();
+    this.renderNewButton(bar, db);
 
-    const shown = views.filter((v) => !hidden.has(v.name) || v.name === current);
+    const shown = views.length < 2 ? [] : views.filter((v) => !hidden.has(v.name) || v.name === current);
     for (const v of shown) {
       const tab = bar.createDiv({ cls: "nk-view-tab" + (v.name === current ? " is-active" : "") });
       const ic = tab.createSpan({ cls: "nk-view-tab-icon" });
@@ -2005,7 +2034,7 @@ class ViewTabsBar {
         menu.showAtMouseEvent(ev);
       };
     }
-    const hiddenViews = views.filter((v) => hidden.has(v.name) && v.name !== current);
+    const hiddenViews = views.length < 2 ? [] : views.filter((v) => hidden.has(v.name) && v.name !== current);
     if (hiddenViews.length) {
       const more = bar.createDiv({ cls: "nk-view-tab nk-view-tab-more", text: `${hiddenViews.length} more…` });
       more.onclick = (ev) => {
@@ -2020,6 +2049,21 @@ class ViewTabsBar {
         menu.showAtMouseEvent(ev);
       };
     }
+  }
+
+  // Notion's split "New ▾" button: New uses the default template, the arrow lists them all
+  renderNewButton(bar, db) {
+    if (!db) return;
+    const lib = this.plugin.templates;
+    const wrap = bar.createDiv({ cls: "nk-new-button" });
+    const main = wrap.createEl("button", { cls: "nk-new-main mod-cta", text: "New" });
+    const def = lib.defaultTemplate(db);
+    main.setAttr("aria-label", def ? `New from "${def.name}"` : "New empty page");
+    main.onclick = () => lib.guard(() => lib.newDefault(db));
+    const arrow = wrap.createEl("button", { cls: "nk-new-arrow mod-cta", attr: { "aria-label": "Choose a template" } });
+    setIconSafe(arrow, ["chevron-down"]);
+    arrow.onclick = (ev) => { ev.preventDefault(); lib.showNewMenu(db, wrap); };
+    wrap.oncontextmenu = (ev) => { ev.preventDefault(); lib.showNewMenu(db, ev); };
   }
 
   async switchTo(leaf, file, name) {
@@ -2074,6 +2118,8 @@ const BUTTON_DEFAULTS = {
 const BUTTON_KEYS = Object.keys(BUTTON_DEFAULTS);
 const DEFAULT_SUBTASK_TEMPLATE = "Templates/RM Tasks/RM Sub-task.md";
 const TEMPLATE_SKIP_KEYS = new Set(["base", "notion-id", "position", "manual_order", "Last edited time"]);
+// template settings (template-default, template-repeat, …) stay on the template
+const skipTemplateKey = (k) => TEMPLATE_SKIP_KEYS.has(k) || /^template-/i.test(k);
 
 const STEP_TYPES = [
   { id: "add-subtask", name: "Add sub-task", icon: "list-plus", desc: "Create a note with Parent task = this page" },
@@ -2081,6 +2127,7 @@ const STEP_TYPES = [
   { id: "complete-subtask", name: "Move to Completed Tasks", icon: "check-square", desc: "On a sub-task: move it to the parent's Completed Tasks and set its status" },
   { id: "unparent-all", name: "Un-parent all sub-tasks", icon: "unlink", desc: "Clear this page's Sub-task list and each child's Parent task" },
   { id: "adopt-matching", name: "Make matching tasks sub-tasks", icon: "filter", desc: "Find tasks that match filters and set their Parent task to this page" },
+  { id: "edit-matching", name: "Edit pages that match", icon: "list-filter", desc: "Change properties on the pages of a database that match filters" },
   { id: "edit-properties", name: "Edit this page's properties", icon: "pencil", desc: "Set, add to or remove from this page's properties" },
   { id: "rename", name: "Rename this page", icon: "text-cursor-input", desc: "Give this page a new name, with optional dates" },
   { id: "insert", name: "Insert text", icon: "text", desc: "Insert lines above or below the button" },
@@ -2179,6 +2226,59 @@ const BUILTIN_BUTTONS = [
     icon: "archive-restore",
     steps: [{ action: "edit-properties", changes: [{ property: "Tag", mode: "remove", value: "Waiting on testing" }, { property: "Team", mode: "set", value: "Release Management" }] }],
   },
+  // Notes Database templates (read 2026-11-27)
+  {
+    label: "Add \"Needs transcription\" tag and set status to \"Needs work\"",
+    icon: "mic",
+    steps: [{ action: "edit-properties", changes: [{ property: "Sub-topic", mode: "set", value: "Needs transcription" }, { property: "Status", mode: "set", value: "Needs work" }] }],
+  },
+  {
+    label: "Add today's date to title",
+    icon: "calendar",
+    steps: [{ action: "rename", name: "{{title}} {{today:MM/DD/YYYY}}" }],
+  },
+  {
+    // RM Standup is on Tuesdays and Thursdays: Tue/Wed -> Thursday, otherwise the next Tuesday
+    label: "Set Future status and Date to next meeting",
+    icon: "calendar-clock",
+    steps: [
+      { action: "edit-properties", changes: [{ property: "Status", mode: "set", value: "Future" }, { property: "Date", mode: "set", value: "{{after:tue,thu:YYYY-MM-DD}}" }] },
+      { action: "rename", name: "RM Standup {{after:tue,thu:MM/DD/YYYY}}" },
+    ],
+  },
+  {
+    label: "Set Future tag and Date to next meeting (meeting is next Tuesday or today)",
+    icon: "calendar-clock",
+    steps: [
+      { action: "edit-properties", changes: [{ property: "Status", mode: "set", value: "Future" }, { property: "Date", mode: "set", value: "{{next:tue:YYYY-MM-DD}}" }] },
+      { action: "rename", name: "1-1 Meeting {{next:tue:MM/DD/YYYY}}" },
+    ],
+  },
+  {
+    label: "Set Future tag and Date to next meeting (meeting is next next Tuesday)",
+    icon: "calendar-clock",
+    steps: [
+      { action: "edit-properties", changes: [{ property: "Status", mode: "set", value: "Future" }, { property: "Date", mode: "set", value: "{{next:tue+1:YYYY-MM-DD}}" }] },
+      { action: "rename", name: "1-1 Meeting {{next:tue+1:MM/DD/YYYY}}" },
+    ],
+  },
+  // Backup Tasks templates (read 2026-11-27)
+  {
+    label: "Mark as Done and update Last Backup Dates",
+    icon: "check-circle",
+    steps: [
+      { action: "edit-properties", changes: [{ property: "Status", mode: "set", value: "Done" }, { property: "Date Completed", mode: "set", value: "{{now:YYYY-MM-DDTHH:mm}}" }] },
+      { action: "edit-matching", base: "Backup Strategy.base", where: [{ property: "Details", op: "contains", value: "FreeFileSync" }, { property: "Backup Status", op: "is", value: "Done (Manual)" }], changes: [{ property: "Last Backup Date", mode: "set", value: "{{now:YYYY-MM-DDTHH:mm}}" }] },
+    ],
+  },
+  {
+    label: "Mark as Done and update Last Backup Date",
+    icon: "check-circle",
+    steps: [
+      { action: "edit-properties", changes: [{ property: "Status", mode: "set", value: "Done" }, { property: "Date Completed", mode: "set", value: "{{now:YYYY-MM-DDTHH:mm}}" }] },
+      { action: "edit-matching", base: "Backup Strategy.base", where: [{ property: "file.name", op: "contains", value: "SD Card" }, { property: "Parent item", op: "contains", value: "Steam Deck" }], changes: [{ property: "Last Backup Date", mode: "set", value: "{{now:YYYY-MM-DDTHH:mm}}" }] },
+    ],
+  },
   {
     label: "Two week reminder and move to General Backlog",
     icon: "alarm-clock",
@@ -2192,28 +2292,90 @@ function safeFileName(name) {
   return String(name || "Untitled").replace(/[\\/:*?"<>|#^[\]]/g, "-").replace(/\s+/g, " ").trim() || "Untitled";
 }
 
-// {{today}}, {{today:YYYY-MM-DD}}, {{next:tuesday:MM-DD-YYYY}}, {{next:tue+1}} (one week later), {{title}}
-function expandVars(text, file) {
-  const m = obsidian.moment;
+// {{today}}, {{today:YYYY-MM-DD}}, {{next:tuesday:MM-DD-YYYY}}, {{next:tue+1}} (one week later), {{title}}, {{now}}
+// `now` (a moment) stands in for the current time, e.g. the scheduled time of a repeating template
+function expandVars(text, file, now) {
+  const m = () => (now ? obsidian.moment(now) : obsidian.moment());
   return String(text === undefined || text === null ? "" : text).replace(/\{\{\s*([^}]+?)\s*\}\}/g, (all, expr) => {
     const parts = expr.split(":");
     const kind = parts[0].trim().toLowerCase();
     if (kind === "title") return file ? displayTitle(file) : "";
+    if (kind === "now") return m().format(parts.slice(1).join(":") || "YYYY-MM-DDTHH:mm:ss");
+    if (kind === "time") return m().format(parts.slice(1).join(":") || "HH:mm");
     const rel = kind.match(/^(today|date)([+-]\d+)?$/);
     if (rel) return m().add(Number(rel[2] || 0), "days").format(parts.slice(1).join(":") || "YYYY-MM-DD");
-    if (kind === "next") {
+    // {{next:tue}} the coming Tuesday, today included; {{after:tue,thu}} the first of those days after today
+    if (kind === "next" || kind === "after") {
       const spec = (parts[1] || "").trim().toLowerCase();
-      const mm = spec.match(/^([a-z]+)(?:\+(\d+))?$/);
-      const day = mm ? WEEKDAYS.findIndex((d) => d.startsWith(mm[1].slice(0, 3))) : -1;
-      if (day < 0) return all;
-      const now = m().startOf("day");
-      let add = day - now.day();
-      if (add < 0) add += 7; // the same weekday counts as "next" (Notion's formula)
-      add += 7 * Number(mm[2] || 0);
-      return now.add(add, "days").format(parts.slice(2).join(":") || "YYYY-MM-DD");
+      const mm = spec.match(/^([a-z, ]+?)(?:\+(\d+))?$/);
+      const days = mm ? mm[1].split(/[ ,]+/).filter(Boolean).map((n) => WEEKDAYS.findIndex((d) => d.startsWith(n.slice(0, 3)))) : [];
+      if (!days.length || days.some((d) => d < 0)) return all;
+      const start = m().startOf("day");
+      let best = Infinity;
+      for (const day of days) {
+        let add = day - start.day();
+        if (add < 0 || (add === 0 && kind === "after")) add += 7; // "next": the same weekday counts (Notion's formula)
+        best = Math.min(best, add);
+      }
+      return start.add(best + 7 * Number(mm[2] || 0), "days").format(parts.slice(2).join(":") || "YYYY-MM-DD");
     }
     return all;
   });
+}
+
+// Like expandVars, but leaves notion-button blocks alone, so a button inside a template
+// still works out {{today}} (and friends) when it's clicked, not when the note was made.
+function expandBody(text, file, now) {
+  const parts = String(text || "").split(/((?:^|\n)[ \t]*(?:```|~~~)[ \t]*notion-button[\s\S]*?\n[ \t]*(?:```|~~~)[ \t]*(?=\n|$))/);
+  return parts.map((p, i) => (i % 2 ? p : expandVars(p, file, now))).join("");
+}
+
+// .base text with templates excluded by its top-level filter; unchanged if already there or the filter is unusual
+function hideFolderInBase(text, folder) {
+  const cond = `file.inFolder(${JSON.stringify(folder)})`;
+  if (text.includes(cond)) return text;
+  const nl = text.includes("\r\n") ? "\r\n" : "\n";
+  const lines = text.split(/\r?\n/);
+  const block = ["    - not:", `        - '${cond.replace(/'/g, "''")}'`];
+  if (lines.some((l) => /^filters:\s*\S/.test(l))) return text; // one-line filter: leave it to the user
+  const f = lines.findIndex((l) => /^filters:\s*$/.test(l));
+  if (f < 0) {
+    // no filters yet: add one before the first top-level key (after leading comments)
+    let at = 0;
+    while (at < lines.length && (/^\s*#/.test(lines[at]) || !lines[at].trim())) at++;
+    lines.splice(at, 0, "filters:", "  and:", ...block);
+    return lines.join(nl);
+  }
+  if (!/^  and:\s*$/.test(lines[f + 1] || "")) {
+    // "filters: or" or a single expression: wrap what's there in an and-group with the new condition
+    let end = f + 1;
+    while (end < lines.length && (/^\s/.test(lines[end]) || !lines[end].trim())) end++;
+    const old = lines.slice(f + 1, end).filter((l) => l.trim());
+    if (!old.length) { lines.splice(f + 1, 0, "  and:", ...block); return lines.join(nl); }
+    if (old.length === 1 && !/^\s*(and|or|not):/.test(old[0])) {
+      lines.splice(f + 1, end - f - 1, "  and:", "    - " + old[0].trim().replace(/^-\s*/, ""), ...block);
+      return lines.join(nl);
+    }
+    lines.splice(f + 1, end - f - 1, "  and:", "    - " + old[0].trim(), ...old.slice(1).map((l) => "    " + l), ...block);
+    return lines.join(nl);
+  }
+  // after the last line of the existing and-list
+  let end = f + 2;
+  while (end < lines.length && /^ {4}/.test(lines[end])) end++;
+  lines.splice(end, 0, ...block);
+  return lines.join(nl);
+}
+
+// New notes start with a properties block, so a body that begins with a "---" divider isn't read as one
+function withPropertiesBlock(body) {
+  return `---\n${TITLE_KEY}: ""\n---\n` + body;
+}
+
+// Template values: strings (and lists of strings) get the same variables as names
+function expandValue(v, file, now) {
+  if (typeof v === "string") return expandVars(v, file, now);
+  if (Array.isArray(v)) return v.map((x) => expandValue(x, file, now));
+  return v;
 }
 
 function normalizeButton(raw) {
@@ -2475,6 +2637,7 @@ class NoteButtons {
       case "complete-subtask": return this.completeSubtask(cfg, step, file);
       case "unparent-all": return this.unparentAll(cfg, file);
       case "adopt-matching": return this.adoptMatching(cfg, step, file);
+      case "edit-matching": return this.editMatching(step, file);
       case "edit-properties": return this.editProperties(step, file);
       case "rename": return this.renameNote(step, file);
       case "insert": return this.insertText(step, file, el, ctx);
@@ -2533,10 +2696,8 @@ class NoteButtons {
     }
     const text = await this.app.vault.read(t);
     const c = this.app.metadataCache.getFileCache(t);
-    const end = c && c.frontmatterPosition ? c.frontmatterPosition.end.offset : -1;
-    let body = text;
-    if (end >= 0) body = text.slice(end).replace(/^\s*---\s*\r?\n?/, "").replace(/^\r?\n/, "");
-    else body = text.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "");
+    // strip only the properties block: blank lines and "---" dividers right after it are content
+    const body = text.replace(/^\uFEFF?---[ \t]*\r?\n(?:[\s\S]*?\r?\n)?---[ \t]*(?:\r?\n|$)/, "");
     const fm = JSON.parse(JSON.stringify((c && c.frontmatter) || {}));
     return { fm, body };
   }
@@ -2551,10 +2712,10 @@ class NoteButtons {
     const folder = step.folder ? obsidian.normalizePath(String(step.folder)) : (from.parent ? from.parent.path : "");
     const tplName = tplPath ? String(tplPath).split("/").pop().replace(/\.md$/, "") : "";
     // Notion keeps the title as typed; the file gets a safe, unique name and the title goes in a property
-    const title = expandVars(step.name || (asChild ? "Subtask" : tplName || "Untitled"), from).replace(/\s+/g, " ").trim() || "Untitled";
-    const note = await this.app.vault.create(uniqueNotePath(this.app, folder, safeFileName(title)), expandVars(tpl.body || "", from));
+    const title = expandVars(step.name || (asChild ? "Subtask" : titleOf(tpl.fm) || tplName || "Untitled"), from).replace(/\s+/g, " ").trim() || "Untitled";
+    const note = await this.app.vault.create(uniqueNotePath(this.app, folder, safeFileName(title)), withPropertiesBlock(expandBody(tpl.body || "", from)));
     await this.app.fileManager.processFrontMatter(note, (fm) => {
-      for (const [k, v] of Object.entries(tpl.fm)) if (!TEMPLATE_SKIP_KEYS.has(k)) fm[k] = v;
+      for (const [k, v] of Object.entries(tpl.fm)) if (!skipTemplateKey(k)) fm[k] = expandValue(v, from);
       fm[TITLE_KEY] = title;
       if (fromFm.base) fm.base = fromFm.base;
       if (asChild) fm[cfg.parentProperty] = [this.linkTo(from)];
@@ -2655,15 +2816,31 @@ class NoteButtons {
     new obsidian.Notice(`Added ${hits.length} matching task${hits.length === 1 ? "" : "s"} as sub-tasks`);
   }
 
+  // Notion: "Edit pages in <database> that match <filters>: <property> = <value>"
+  async editMatching(step, from) {
+    const fromFm = this.fm(from);
+    const base = step.base ? `[[${String(step.base).replace(/^\[\[|\]\]$/g, "").replace(/(\.base)?$/, ".base")}]]` : asString(fromFm.base);
+    const want = parseLink(base).linkpath.split("/").pop();
+    const rules = asList(step.where);
+    const hits = this.app.vault.getMarkdownFiles().filter((f) => {
+      if (f.path === from.path) return false;
+      const fm = this.fm(f);
+      if (!want || parseLink(asString(fm.base)).linkpath.split("/").pop() !== want) return false;
+      return rules.every((r) => this.matches(f, fm, r));
+    });
+    for (const f of hits) await this.editProperties(step, f, from);
+    new obsidian.Notice(`Updated ${hits.length} page${hits.length === 1 ? "" : "s"}`);
+  }
+
   // Notion: "Edit This page: <property> set / add / remove <value>"
-  async editProperties(step, file) {
+  async editProperties(step, file, varsFrom) {
     const changes = asList(step.changes);
     await this.app.fileManager.processFrontMatter(file, (fm) => {
       for (const ch of changes) {
         const key = ch && ch.property;
         if (!key) continue;
         const mode = String(ch.mode || "set").toLowerCase();
-        const value = typeof ch.value === "string" ? expandVars(ch.value, file) : ch.value;
+        const value = typeof ch.value === "string" ? expandVars(ch.value, varsFrom || file) : ch.value;
         const values = asList(value).map((v) => (typeof v === "string" ? v : v));
         if (mode === "add") {
           const cur = asList(fm[key]);
@@ -2871,6 +3048,7 @@ class ButtonBuilderModal extends obsidian.Modal {
     if (id === "complete-subtask") return { action: id, status: "Closed" };
     if (id === "adopt-matching") return { action: id, where: [{ property: "Tag", op: "contains", value: "" }] };
     if (id === "edit-properties") return { action: id, changes: [{ property: "Tag", mode: "add", value: "" }] };
+    if (id === "edit-matching") return { action: id, base: "", where: [{ property: "file.name", op: "contains", value: "" }], changes: [{ property: "", mode: "set", value: "" }] };
     if (id === "rename") return { action: id, name: "{{title}}" };
     if (id === "insert") return { action: id, text: "- [ ] ", position: "above" };
     return { action: id };
@@ -2929,6 +3107,38 @@ class ButtonBuilderModal extends obsidian.Modal {
       });
     };
 
+    const whereUI = (label) => {
+      step.where = asList(step.where);
+      card.createDiv({ cls: "nk-bb-step-sub", text: label });
+      step.where.forEach((rule, k) => {
+        const s = new obsidian.Setting(card).setClass("nk-bb-rule");
+        s.addText((t) => t.setPlaceholder("Property (or file.name)").setValue(rule.property || "").onChange((v) => { rule.property = v.trim(); }));
+        s.addDropdown((d) => {
+          for (const [id, label] of FILTER_OPS) d.addOption(id, label);
+          d.setValue(rule.op || "contains").onChange((v) => { rule.op = v; this.draw(); });
+        });
+        if (!["is-empty", "not-empty"].includes(rule.op)) s.addText((t) => t.setPlaceholder("Value").setValue(rule.value === undefined ? "" : String(rule.value)).onChange((v) => { rule.value = v; }));
+        s.addExtraButton((x) => x.setIcon("x").setTooltip("Remove filter").onClick(() => { step.where.splice(k, 1); this.draw(); }));
+      });
+      new obsidian.Setting(card).addButton((x) => x.setButtonText("Add filter").onClick(() => { step.where.push({ property: "", op: "contains", value: "" }); this.draw(); }));
+    };
+    const changesUI = () => {
+      step.changes = asList(step.changes);
+      step.changes.forEach((ch, k) => {
+        const s = new obsidian.Setting(card).setClass("nk-bb-rule");
+        s.addText((t) => t.setPlaceholder("Property").setValue(ch.property || "").onChange((v) => { ch.property = v.trim(); }));
+        s.addDropdown((d) => d
+          .addOption("set", "set to")
+          .addOption("add", "add")
+          .addOption("remove", "remove")
+          .addOption("clear", "clear")
+          .setValue(ch.mode || "set")
+          .onChange((v) => { ch.mode = v; this.draw(); }));
+        if (ch.mode !== "clear") s.addText((t) => t.setPlaceholder("Value").setValue(ch.value === undefined ? "" : asString(ch.value)).onChange((v) => { ch.value = v; }));
+        s.addExtraButton((x) => x.setIcon("x").setTooltip("Remove").onClick(() => { step.changes.splice(k, 1); this.draw(); }));
+      });
+      new obsidian.Setting(card).addButton((x) => x.setButtonText("Edit another property").onClick(() => { step.changes.push({ property: "", mode: "set", value: "" }); this.draw(); }));
+    };
     switch (step.action) {
       case "add-subtask":
         text("Name", "name", "Subtask", "Use {{title}} for this page's name, {{today:MM-DD-YYYY}} for a date.");
@@ -2947,40 +3157,18 @@ class ButtonBuilderModal extends obsidian.Modal {
         break;
       case "unparent-all":
         break;
-      case "adopt-matching": {
-        step.where = asList(step.where);
-        card.createDiv({ cls: "nk-bb-step-sub", text: "Tasks in the same database where every filter matches:" });
-        step.where.forEach((rule, k) => {
-          const s = new obsidian.Setting(card).setClass("nk-bb-rule");
-          s.addText((t) => t.setPlaceholder("Property (or file.name)").setValue(rule.property || "").onChange((v) => { rule.property = v.trim(); }));
-          s.addDropdown((d) => {
-            for (const [id, label] of FILTER_OPS) d.addOption(id, label);
-            d.setValue(rule.op || "contains").onChange((v) => { rule.op = v; this.draw(); });
-          });
-          if (!["is-empty", "not-empty"].includes(rule.op)) s.addText((t) => t.setPlaceholder("Value").setValue(rule.value === undefined ? "" : String(rule.value)).onChange((v) => { rule.value = v; }));
-          s.addExtraButton((x) => x.setIcon("x").setTooltip("Remove filter").onClick(() => { step.where.splice(k, 1); this.draw(); }));
-        });
-        new obsidian.Setting(card).addButton((x) => x.setButtonText("Add filter").onClick(() => { step.where.push({ property: "", op: "contains", value: "" }); this.draw(); }));
+      case "adopt-matching":
+        whereUI("Tasks in the same database where every filter matches:");
         break;
-      }
-      case "edit-properties": {
-        step.changes = asList(step.changes);
-        step.changes.forEach((ch, k) => {
-          const s = new obsidian.Setting(card).setClass("nk-bb-rule");
-          s.addText((t) => t.setPlaceholder("Property").setValue(ch.property || "").onChange((v) => { ch.property = v.trim(); }));
-          s.addDropdown((d) => d
-            .addOption("set", "set to")
-            .addOption("add", "add")
-            .addOption("remove", "remove")
-            .addOption("clear", "clear")
-            .setValue(ch.mode || "set")
-            .onChange((v) => { ch.mode = v; this.draw(); }));
-          if (ch.mode !== "clear") s.addText((t) => t.setPlaceholder("Value").setValue(ch.value === undefined ? "" : asString(ch.value)).onChange((v) => { ch.value = v; }));
-          s.addExtraButton((x) => x.setIcon("x").setTooltip("Remove").onClick(() => { step.changes.splice(k, 1); this.draw(); }));
-        });
-        new obsidian.Setting(card).addButton((x) => x.setButtonText("Edit another property").onClick(() => { step.changes.push({ property: "", mode: "set", value: "" }); this.draw(); }));
+      case "edit-properties":
+        changesUI();
         break;
-      }
+      case "edit-matching":
+        text("Database", "base", "Leave empty for this page's database", "The .base file name, e.g. Backup Strategy.base");
+        whereUI("Pages in that database where every filter matches:");
+        card.createDiv({ cls: "nk-bb-step-sub", text: "Change on each of them:" });
+        changesUI();
+        break;
       case "rename":
         text("New name", "name", "1-1 Meeting {{next:tuesday:MM-DD-YYYY}}", "{{title}} = current name, {{today:FORMAT}}, {{next:tuesday:FORMAT}} = the coming Tuesday (today counts), {{next:tuesday+1:FORMAT}} = a week after that.");
         break;
@@ -3000,6 +3188,844 @@ class ButtonBuilderModal extends obsidian.Modal {
       }
       default:
         card.createDiv({ cls: "nk-bb-step-sub", text: "This action can only be edited in the code block." });
+    }
+  }
+}
+
+// ---------- Notion-style database templates ----------
+//
+// Each base ("database") gets its templates from Templates/<base name>/, e.g.
+// Templates/RM Tasks/ for RM Tasks.base. A template is an ordinary note: its
+// properties and content are copied into the new note, which goes in the base's
+// folder with base: [[<base>.base]]. Template settings live in the template's
+// own frontmatter, so they sync to every device:
+//   title: Update Pilot Tracking {{today:MM/DD/YYYY}}   the new note's title
+//   template-default: true                             the New button / board + use it
+//   template-repeat: weekly on wed at 08:00            make one on a schedule
+//   template-repeat-last: 2026-11-25T08:00             last scheduled run made
+//   template-repeat-catch-up: latest                   missed runs: all (default) or latest
+// Repeats run while Obsidian is open; runs missed while every device was off are made
+// the next time Obsidian starts or comes back to the foreground (after a short wait
+// so sync can bring in notes another device already made). Each scheduled note gets
+// template-run: <database>/<template>@<time>, and a run that already has a note is skipped.
+// See docs/templates.md.
+
+const TEMPLATES_ROOT = "Templates";
+const RUN_KEY = "template-run";
+const REPEAT_KEY = "template-repeat";
+const REPEAT_LAST_KEY = "template-repeat-last";
+const REPEAT_CATCHUP_KEY = "template-repeat-catch-up";
+const DEFAULT_KEY = "template-default";
+const ORDER_KEY = "template-order";
+const SLOT_FORMAT = "YYYY-MM-DDTHH:mm";
+const MAX_CATCH_UP = 60;
+const DAY_ABBR = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+const DAY_LABEL = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const ORDINALS = { 1: "1st", 2: "2nd", 3: "3rd", 4: "4th", 5: "5th" };
+const MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+// ----- repeat rules -----
+//   daily at 08:00                 every 2 days at 08:00 from 2026-11-27
+//   weekdays at 08:00
+//   weekly on mon, wed at 08:00    every 2 weeks on fri at 09:00 from 2026-11-27
+//   monthly on day 1 at 06:00      every 3 months on day 1 at 06:00 from 2026-10-01
+//   monthly on last day at 17:00
+//   yearly on 01-15 at 09:00
+
+function parseRepeat(raw) {
+  if (raw === undefined || raw === null || raw === false) return null;
+  let t = String(raw).trim().toLowerCase().replace(/\s+/g, " ");
+  if (!t || t === "off" || t === "none" || t === "false") return null;
+  const r = { freq: null, every: 1, days: [], monthDay: 1, month: 1, time: "09:00", from: null };
+  let m = t.match(/\s+from (\d{4}-\d{2}-\d{2})$/);
+  if (m) { r.from = m[1]; t = t.slice(0, m.index); }
+  m = t.match(/\s+at (\d{1,2})(?::(\d{2}))? ?(am|pm)?$/);
+  if (m) {
+    let h = Number(m[1]);
+    if (m[3] === "pm" && h < 12) h += 12;
+    if (m[3] === "am" && h === 12) h = 0;
+    r.time = `${String(Math.min(h, 23)).padStart(2, "0")}:${m[2] || "00"}`;
+    t = t.slice(0, m.index);
+  }
+  m = t.match(/^every (\d+) (day|week|month|year)s?(?: (.*))?$/);
+  let rest = "";
+  if (m) { r.every = Math.max(1, Number(m[1])); r.freq = m[2]; rest = m[3] || ""; }
+  else if ((m = t.match(/^(daily|weekdays|weekly|monthly|quarterly|yearly|annually)(?: (.*))?$/))) {
+    r.freq = { daily: "day", weekdays: "weekdays", weekly: "week", monthly: "month", quarterly: "month", yearly: "year", annually: "year" }[m[1]];
+    if (m[1] === "quarterly") r.every = 3;
+    rest = m[2] || "";
+  } else return null;
+  if (r.freq === "week") {
+    r.days = (rest.replace(/^on /, "").match(/[a-z]+/g) || []).map((d) => DAY_ABBR.indexOf(d.slice(0, 3))).filter((d) => d >= 0);
+    if (!r.days.length) r.days = [r.from ? obsidian.moment(r.from).day() : 1];
+    r.days = [...new Set(r.days)].sort();
+  } else if (r.freq === "month") {
+    const wk = rest.match(/(1st|2nd|3rd|4th|5th|first|second|third|fourth|fifth|last) (sun|mon|tue|wed|thu|fri|sat)[a-z]*/);
+    if (wk) {
+      const n = { "1st": 1, first: 1, "2nd": 2, second: 2, "3rd": 3, third: 3, "4th": 4, fourth: 4, "5th": 5, fifth: 5, last: "last" }[wk[1]];
+      r.weekOfMonth = n;
+      r.weekday = DAY_ABBR.indexOf(wk[2]);
+    } else {
+      const d = rest.match(/(last|\d{1,2})/);
+      r.monthDay = d ? (d[1] === "last" ? "last" : Math.min(31, Math.max(1, Number(d[1])))) : 1;
+    }
+  } else if (r.freq === "year") {
+    const d = rest.match(/(\d{1,2})-(\d{1,2})/);
+    if (d) { r.month = Math.min(12, Number(d[1])); r.monthDay = Math.min(31, Number(d[2])); }
+  }
+  return r;
+}
+
+function repeatToString(r) {
+  if (!r || !r.freq) return "";
+  const at = ` at ${r.time || "09:00"}`;
+  const n = Number(r.every) || 1;
+  const from = n > 1 && r.from ? ` from ${r.from}` : "";
+  const pad = (x) => String(x).padStart(2, "0");
+  switch (r.freq) {
+    case "day": return (n > 1 ? `every ${n} days` : "daily") + at + from;
+    case "weekdays": return "weekdays" + at;
+    case "week": return (n > 1 ? `every ${n} weeks` : "weekly") + ` on ${(r.days.length ? r.days : [1]).map((d) => DAY_ABBR[d]).join(", ")}` + at + from;
+    case "month": return (n > 1 ? `every ${n} months` : "monthly") + ` on ${r.weekOfMonth ? `${r.weekOfMonth === "last" ? "last" : ORDINALS[r.weekOfMonth]} ${DAY_ABBR[r.weekday]}` : r.monthDay === "last" ? "last day" : "day " + r.monthDay}` + at + from;
+    case "year": return (n > 1 ? `every ${n} years` : "yearly") + ` on ${pad(r.month)}-${pad(r.monthDay)}` + at + from;
+  }
+  return "";
+}
+
+function formatTime(time) {
+  return obsidian.moment(time || "09:00", "HH:mm").format("h:mm A");
+}
+
+// "Every month on day 1 at 7:00 AM · next Tue Dec 1, 7:00 AM"
+function repeatSummary(r) {
+  const next = r ? nextRepeat(r, obsidian.moment()) : null;
+  return `${describeRepeat(r)}${next ? ` · next ${next.format("ddd MMM D, h:mm A")}` : ""}`;
+}
+
+function describeRepeat(r) {
+  if (!r) return "Doesn't repeat";
+  const n = Number(r.every) || 1;
+  const at = ` at ${formatTime(r.time)}`;
+  const ord = (d) => obsidian.moment.localeData().ordinal(Number(d));
+  switch (r.freq) {
+    case "day": return (n > 1 ? `Every ${n} days` : "Every day") + at;
+    case "weekdays": return "Every weekday" + at;
+    case "week": return (n > 1 ? `Every ${n} weeks` : "Every week") + " on " + r.days.map((d) => DAY_LABEL[d]).join(", ") + at;
+    case "month": {
+      const on = r.weekOfMonth ? `the ${r.weekOfMonth === "last" ? "last" : ORDINALS[r.weekOfMonth]} ${DAY_LABEL[r.weekday]}` : r.monthDay === "last" ? "the last day" : "the " + ord(r.monthDay);
+      return (n === 3 ? "Every quarter" : n > 1 ? `Every ${n} months` : "Every month") + ` on ${on}` + at;
+    }
+    case "year": return (n > 1 ? `Every ${n} years` : "Every year") + ` on ${MONTH_ABBR[r.month - 1]} ${r.monthDay}` + at;
+  }
+  return "Doesn't repeat";
+}
+
+function repeatMatchesDay(r, day) {
+  const from = r.from ? obsidian.moment(r.from, "YYYY-MM-DD").startOf("day") : null;
+  const n = Number(r.every) || 1;
+  switch (r.freq) {
+    case "day":
+      return !from || n === 1 ? true : day.diff(from, "days") % n === 0 && !day.isBefore(from);
+    case "weekdays":
+      return day.day() >= 1 && day.day() <= 5;
+    case "week": {
+      if (!r.days.includes(day.day())) return false;
+      if (n === 1 || !from) return true;
+      const weeks = Math.round(day.clone().startOf("week").diff(from.clone().startOf("week"), "days") / 7);
+      return weeks >= 0 && weeks % n === 0;
+    }
+    case "month": {
+      const last = day.daysInMonth();
+      if (r.weekOfMonth) {
+        if (day.day() !== r.weekday) return false;
+        if (r.weekOfMonth === "last" ? day.date() + 7 <= last : Math.ceil(day.date() / 7) !== r.weekOfMonth) return false;
+      } else {
+        const want = r.monthDay === "last" ? last : Math.min(Number(r.monthDay) || 1, last);
+        if (day.date() !== want) return false;
+      }
+      if (n === 1 || !from) return true;
+      const months = (day.year() - from.year()) * 12 + (day.month() - from.month());
+      return months >= 0 && months % n === 0;
+    }
+    case "year": {
+      if (day.month() + 1 !== r.month) return false;
+      if (day.date() !== Math.min(r.monthDay, day.daysInMonth())) return false;
+      return n === 1 || !from || ((day.year() - from.year()) >= 0 && (day.year() - from.year()) % n === 0);
+    }
+  }
+  return false;
+}
+
+// the first scheduled time strictly after `after`
+function nextRepeat(r, after) {
+  if (!r) return null;
+  const [h, mi] = String(r.time || "09:00").split(":").map(Number);
+  let day = obsidian.moment(after).startOf("day");
+  if (r.from && day.isBefore(obsidian.moment(r.from, "YYYY-MM-DD"))) day = obsidian.moment(r.from, "YYYY-MM-DD").startOf("day");
+  for (let i = 0; i < 366 * Math.max(1, r.freq === "year" ? r.every : 1) + 400; i++) {
+    if (repeatMatchesDay(r, day)) {
+      const at = day.clone().hour(h || 0).minute(mi || 0).second(0).millisecond(0);
+      if (at.isAfter(after)) return at;
+    }
+    day.add(1, "day");
+  }
+  return null;
+}
+
+// ----- the library -----
+
+class TemplateLibrary {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.app = plugin.app;
+    this.running = false;
+    this.readyAt = 0;
+  }
+
+  get root() {
+    return obsidian.normalizePath(this.plugin.settings.templatesFolder || TEMPLATES_ROOT);
+  }
+  get delaySeconds() {
+    const v = Number(this.plugin.settings.repeatDelaySeconds);
+    return Number.isFinite(v) && v >= 0 ? v : 15;
+  }
+
+  load() {
+    const p = this.plugin;
+    p.addCommand({ id: "new-from-template", name: "New note from template", callback: () => this.openPicker() });
+    p.addCommand({ id: "manage-templates", name: "Manage templates", callback: () => this.openManager() });
+    p.addCommand({ id: "run-repeating-templates", name: "Make any due repeating-template notes now", callback: () => this.runDue(true) });
+    p.addRibbonIcon("copy-plus", "New note from template", () => this.openPicker());
+    // repeats: after start-up (and after coming back to the foreground) wait for sync, then catch up
+    this.app.workspace.onLayoutReady(() => this.scheduleCheck());
+    p.registerDomEvent(document, "visibilitychange", () => { if (document.visibilityState === "visible") this.scheduleCheck(); });
+    p.registerInterval(window.setInterval(() => { if (Date.now() >= this.readyAt) this.runDue(false); }, 60 * 1000));
+    // "You're editing a template" banner on template notes
+    const refresh = obsidian.debounce(() => this.refreshBanners(), 100, true);
+    p.registerEvent(this.app.workspace.on("layout-change", refresh));
+    p.registerEvent(this.app.workspace.on("file-open", refresh));
+    p.registerEvent(this.app.metadataCache.on("changed", (f) => { if (f.path.startsWith(this.root + "/")) refresh(); }));
+    p.registerEvent(this.app.vault.on("rename", refresh));
+    this.app.workspace.onLayoutReady(refresh);
+    // template notes never show in a database's views (Notion keeps templates out of the table too)
+    this.app.workspace.onLayoutReady(() => window.setTimeout(() => this.hideTemplatesEverywhere(), 2000));
+  }
+
+  // ----- keep templates out of the bases -----
+
+  async hideTemplatesEverywhere() {
+    for (const db of this.databases()) await this.hideTemplatesIn(db.base);
+  }
+
+  // adds `not: file.inFolder("Templates")` to the base's top-level filters (all its views), once
+  async hideTemplatesIn(baseFile) {
+    if (!(baseFile instanceof obsidian.TFile)) return;
+    try {
+      await this.app.vault.process(baseFile, (text) => hideFolderInBase(text, this.root));
+    } catch (e) {
+      console.error("[notion-style-kanban] couldn't add the templates filter to " + baseFile.path, e);
+    }
+  }
+
+  // ----- template banner -----
+
+  refreshBanners() {
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const view = leaf.view;
+      if (!view || !view.containerEl || !view.contentEl) continue;
+      const info = view.file ? this.templateInfo(view.file) : null;
+      let banner = view.containerEl.querySelector(":scope > .nk-tpl-banner");
+      if (!info) { if (banner) banner.remove(); continue; }
+      const sig = [info.db.name, info.t.file.path, info.t.fm[REPEAT_KEY] || "", info.t.isDefault].join("|");
+      if (banner && banner.dataset.sig === sig) continue;
+      if (banner) banner.remove();
+      banner = this.renderBanner(info);
+      banner.dataset.sig = sig;
+      view.containerEl.insertBefore(banner, view.contentEl);
+    }
+  }
+
+  removeBanners() {
+    document.querySelectorAll(".nk-tpl-banner").forEach((el) => el.remove());
+  }
+
+  renderBanner({ db, t }) {
+    const el = createDiv({ cls: "nk-tpl-banner" });
+    const inner = el.createDiv({ cls: "nk-tpl-banner-inner" });
+    inner.createSpan({ text: "You’re editing a template in" });
+    const link = inner.createEl("a", { cls: "nk-tpl-banner-db", href: "#" });
+    setIconSafe(link.createSpan({ cls: "nk-tpl-banner-db-icon" }), ["table-2", "table"]);
+    link.createSpan({ text: db.name });
+    link.addEventListener("click", (e) => { e.preventDefault(); this.app.workspace.getLeaf(false).openFile(db.base); });
+    const help = inner.createSpan({ cls: "nk-tpl-banner-help", attr: { "aria-label": "Changes here apply to new notes made from this template. Notes already made from it don't change." } });
+    setIconSafe(help, ["help-circle", "circle-help"]);
+    if (t.isDefault) inner.createSpan({ cls: "nk-tpl-banner-badge", text: "Default" });
+    const btn = inner.createEl("button", { cls: "nk-tpl-banner-repeat" + (t.repeat ? " is-on" : "") });
+    setIconSafe(btn.createSpan({ cls: "nk-tpl-banner-repeat-icon" }), ["repeat"]);
+    btn.createSpan({ text: t.repeat ? `Duplicate ${describeRepeat(t.repeat).replace(/^Every/, "every")}` : "Repeat" });
+    setIconSafe(btn.createSpan({ cls: "nk-tpl-banner-chevron" }), ["chevron-down"]);
+    if (t.repeat) {
+      const next = nextRepeat(t.repeat, obsidian.moment());
+      if (next) btn.setAttr("aria-label", `Next: ${next.format("ddd MMM D, h:mm A")}`);
+    }
+    btn.addEventListener("click", () => {
+      const fresh = this.templateInfo(t.file);
+      new RepeatModal(this, fresh ? fresh.t : t, () => this.refreshBanners()).open();
+    });
+    return el;
+  }
+
+  scheduleCheck() {
+    const ms = this.delaySeconds * 1000;
+    this.readyAt = Date.now() + ms;
+    if (this.timer) window.clearTimeout(this.timer);
+    this.timer = window.setTimeout(() => { this.timer = null; this.runDue(false); }, ms);
+  }
+
+  unload() {
+    if (this.timer) window.clearTimeout(this.timer);
+    this.removeBanners();
+  }
+
+  // ----- databases and their templates -----
+
+  fm(file) {
+    const c = this.app.metadataCache.getFileCache(file);
+    return (c && c.frontmatter) || {};
+  }
+
+  databases() {
+    const out = [];
+    for (const f of this.app.vault.getFiles()) {
+      if (f.extension !== "base") continue;
+      const folder = this.app.vault.getAbstractFileByPath(obsidian.normalizePath(`${this.root}/${f.basename}`));
+      if (!(folder instanceof obsidian.TFolder)) continue;
+      out.push(this.dbFor(f, folder));
+    }
+    return out.sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  dbFor(baseFile, folder) {
+    return {
+      name: baseFile.basename,
+      base: baseFile,
+      folderPath: folder ? folder.path : obsidian.normalizePath(`${this.root}/${baseFile.basename}`),
+      notesFolder: baseFile.parent ? baseFile.parent.path : "",
+      baseLink: `[[${baseFile.name}]]`,
+    };
+  }
+
+  dbForBase(baseFile) {
+    if (!baseFile) return null;
+    const folder = this.app.vault.getAbstractFileByPath(obsidian.normalizePath(`${this.root}/${baseFile.basename}`));
+    return this.dbFor(baseFile, folder instanceof obsidian.TFolder ? folder : null);
+  }
+
+  templates(db) {
+    const prefix = db.folderPath + "/";
+    const list = this.app.vault.getMarkdownFiles().filter((f) => f.path.startsWith(prefix));
+    const name = (f) => f.path.slice(prefix.length).replace(/\.md$/, "");
+    return list
+      .map((f) => ({ file: f, name: name(f), fm: this.fm(f) }))
+      .map((t) => Object.assign(t, {
+        isDefault: t.fm[DEFAULT_KEY] === true || String(t.fm[DEFAULT_KEY]).toLowerCase() === "true",
+        repeat: parseRepeat(t.fm[REPEAT_KEY]),
+        order: Number.isFinite(Number(t.fm[ORDER_KEY])) && t.fm[ORDER_KEY] !== null && t.fm[ORDER_KEY] !== "" ? Number(t.fm[ORDER_KEY]) : Infinity,
+      }))
+      // the order set by dragging in Manage templates; templates never placed go last, default first
+      .sort((a, b) => (a.order === b.order ? 0 : a.order < b.order ? -1 : 1) || (b.isDefault - a.isDefault) || a.name.localeCompare(b.name));
+  }
+
+  // Manage templates drag-and-drop: write 1..n to template-order (only where it changed)
+  async setOrder(list) {
+    for (let i = 0; i < list.length; i++) {
+      const t = list[i];
+      if (t.order === i + 1) continue;
+      await this.app.fileManager.processFrontMatter(t.file, (fm) => { fm[ORDER_KEY] = i + 1; });
+    }
+  }
+
+  // the database and template entry for a template note (null if the note isn't one)
+  templateInfo(file) {
+    if (!(file instanceof obsidian.TFile) || file.extension !== "md") return null;
+    const root = this.root + "/";
+    if (!file.path.startsWith(root)) return null;
+    const dbName = file.path.slice(root.length).split("/")[0];
+    const base = this.app.vault.getFiles().find((f) => f.extension === "base" && f.basename === dbName);
+    if (!base) return null;
+    const db = this.dbForBase(base);
+    const t = this.templates(db).find((x) => x.file.path === file.path);
+    return t ? { db, t } : null;
+  }
+
+  defaultTemplate(db) {
+    return db ? this.templates(db).find((t) => t.isDefault) || null : null;
+  }
+
+  templateIcon(t) {
+    return t.fm.icon ? String(t.fm.icon) : "";
+  }
+
+  // ----- making notes -----
+
+  // opts: { now (moment), open: "tab" | "none", properties: {}, runId }
+  async create(db, tpl, opts) {
+    opts = opts || {};
+    const now = opts.now || null;
+    const read = tpl ? await this.plugin.noteButtons.readTemplate(tpl.file.path) : { fm: {}, body: "" };
+    const rawTitle = opts.title !== undefined ? opts.title : read.fm[TITLE_KEY] !== undefined ? String(read.fm[TITLE_KEY] || "") : tpl ? tpl.file.basename : "";
+    const title = expandVars(rawTitle, null, now).replace(/\s+/g, " ").trim();
+    const folder = db.notesFolder;
+    if (folder && !this.app.vault.getAbstractFileByPath(folder)) await this.app.vault.createFolder(folder);
+    const note = await this.app.vault.create(uniqueNotePath(this.app, folder, safeFileName(title || "Untitled")), withPropertiesBlock(expandBody(read.body || "", null, now)));
+    await this.app.fileManager.processFrontMatter(note, (fm) => {
+      for (const [k, v] of Object.entries(read.fm)) if (!skipTemplateKey(k)) fm[k] = expandValue(v, null, now);
+      fm[TITLE_KEY] = title;
+      fm.base = db.baseLink;
+      for (const [k, v] of Object.entries(opts.properties || {})) fm[k] = v;
+      if (opts.runId) fm[RUN_KEY] = opts.runId;
+    });
+    if (opts.open !== "none") {
+      // an empty title (or one ending in " - ", Notion's "finish typing the name") gets the cursor
+      if (!title || / [-–:]$/.test(rawTitle.trimEnd())) this.plugin.focusTitlePath = note.path;
+      const leaf = this.app.workspace.getLeaf("tab");
+      await leaf.openFile(note, { state: { mode: "source" } });
+    }
+    return note;
+  }
+
+  async guard(fn) {
+    try { return await fn(); } catch (e) {
+      console.error("[notion-style-kanban] templates", e);
+      new obsidian.Notice("Template failed: " + (e && e.message ? e.message : e));
+    }
+  }
+
+  // ----- menus -----
+
+  // the Notion "New ▾" menu for one database
+  showNewMenu(db, ev, extra) {
+    const menu = new obsidian.Menu();
+    const list = this.templates(db);
+    for (const t of list) {
+      menu.addItem((i) => {
+        i.setTitle(t.name + (t.isDefault ? "  (default)" : "") + (t.repeat ? "  ↻" : ""))
+          .setIcon(t.repeat ? "repeat" : "file-text")
+          .onClick(() => this.guard(() => this.create(db, t, extra)));
+        const ic = this.templateIcon(t);
+        if (ic && i.iconEl) { i.iconEl.empty(); if (!renderIconValue(i.iconEl, ic)) setIconSafe(i.iconEl, ["file-text"]); }
+      });
+    }
+    if (list.length) menu.addSeparator();
+    menu.addItem((i) => i.setTitle("Empty page").setIcon("file").onClick(() => this.guard(() => this.create(db, null, Object.assign({ title: "" }, extra || {})))));
+    menu.addItem((i) => i.setTitle("New template").setIcon("plus").onClick(() => this.guard(() => this.newTemplate(db))));
+    menu.addItem((i) => i.setTitle("Manage templates…").setIcon("settings").onClick(() => this.openManager(db)));
+    if (ev instanceof MouseEvent) menu.showAtMouseEvent(ev);
+    else if (ev && ev.getBoundingClientRect) { const r = ev.getBoundingClientRect(); menu.showAtPosition({ x: r.left, y: r.bottom + 4 }); }
+    else menu.showAtPosition({ x: window.innerWidth / 2, y: 120 });
+  }
+
+  // the main "New" button: the default template, or an empty page
+  async newDefault(db, extra) {
+    const t = this.defaultTemplate(db);
+    return this.create(db, t, Object.assign(t ? {} : { title: "" }, extra || {}));
+  }
+
+  openPicker() {
+    const items = [];
+    for (const db of this.databases()) {
+      for (const t of this.templates(db)) items.push({ db, t });
+      items.push({ db, t: null });
+    }
+    if (!items.length) {
+      new obsidian.Notice(`No templates yet. Put templates in ${this.root}/<base name>/, or use "Manage templates".`);
+      return;
+    }
+    new TemplatePickerModal(this, items).open();
+  }
+
+  openManager(db) {
+    const dbs = this.databases();
+    if (!db) {
+      const active = this.app.workspace.getActiveFile();
+      if (active && active.extension === "base") db = this.dbForBase(active);
+      else if (active) {
+        const base = parseLink(asString(this.fm(active).base)).linkpath;
+        const bf = base ? this.app.metadataCache.getFirstLinkpathDest(base, active.path) : null;
+        if (bf) db = this.dbForBase(bf);
+      }
+    }
+    if (!db) db = dbs[0];
+    if (!db) {
+      const bases = this.app.vault.getFiles().filter((f) => f.extension === "base");
+      if (!bases.length) return new obsidian.Notice("No bases in this vault yet.");
+      db = this.dbForBase(bases[0]);
+    }
+    new TemplateManagerModal(this, db).open();
+  }
+
+  async newTemplate(db, name) {
+    await this.ensureFolder(db.folderPath);
+    await this.hideTemplatesIn(db.base);
+    const path = uniqueNotePath(this.app, db.folderPath, safeFileName(name || "New template"));
+    const file = await this.app.vault.create(path, "");
+    await this.app.fileManager.processFrontMatter(file, (fm) => { fm[TITLE_KEY] = ""; });
+    this.plugin.focusTitlePath = null;
+    await this.app.workspace.getLeaf("tab").openFile(file, { state: { mode: "source" } });
+    new obsidian.Notice("New template: rename the file to name the template. Its title property becomes the new note's title.");
+    return file;
+  }
+
+  async ensureFolder(path) {
+    const parts = path.split("/");
+    for (let i = 1; i <= parts.length; i++) {
+      const p = parts.slice(0, i).join("/");
+      if (!this.app.vault.getAbstractFileByPath(p)) await this.app.vault.createFolder(p);
+    }
+  }
+
+  async setDefault(db, tpl) {
+    for (const t of this.templates(db)) {
+      const want = !!tpl && t.file.path === tpl.file.path && !t.isDefault;
+      if (want === t.isDefault) continue;
+      await this.app.fileManager.processFrontMatter(t.file, (fm) => { if (want) fm[DEFAULT_KEY] = true; else delete fm[DEFAULT_KEY]; });
+    }
+  }
+
+  async duplicate(db, tpl) {
+    const text = await this.app.vault.read(tpl.file);
+    const folder = tpl.file.parent ? tpl.file.parent.path : db.folderPath;
+    const file = await this.app.vault.create(uniqueNotePath(this.app, folder, tpl.file.basename + " copy"), text);
+    await this.app.fileManager.processFrontMatter(file, (fm) => { delete fm[DEFAULT_KEY]; delete fm[REPEAT_KEY]; delete fm[REPEAT_LAST_KEY]; });
+    return file;
+  }
+
+  async setRepeat(tpl, rule, catchUp) {
+    const str = repeatToString(rule);
+    await this.app.fileManager.processFrontMatter(tpl.file, (fm) => {
+      const before = fm[REPEAT_KEY];
+      if (!str) { delete fm[REPEAT_KEY]; delete fm[REPEAT_LAST_KEY]; delete fm[REPEAT_CATCHUP_KEY]; return; }
+      fm[REPEAT_KEY] = str;
+      // a new or changed schedule starts from now: no notes for times before it was set
+      if (before !== str || !fm[REPEAT_LAST_KEY]) fm[REPEAT_LAST_KEY] = obsidian.moment().format(SLOT_FORMAT);
+      if (catchUp === "latest") fm[REPEAT_CATCHUP_KEY] = "latest"; else delete fm[REPEAT_CATCHUP_KEY];
+    });
+  }
+
+  // ----- repeats -----
+
+  runIds() {
+    const ids = new Set();
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      const v = this.fm(f)[RUN_KEY];
+      if (v) ids.add(String(v));
+    }
+    return ids;
+  }
+
+  async runDue(manual) {
+    if (this.running) return;
+    this.running = true;
+    let made = 0;
+    try {
+      const now = obsidian.moment();
+      let ids = null;
+      for (const db of this.databases()) {
+        for (const t of this.templates(db)) {
+          if (!t.repeat) continue;
+          const lastRaw = t.fm[REPEAT_LAST_KEY];
+          const last = lastRaw ? obsidian.moment(String(lastRaw), [SLOT_FORMAT, "YYYY-MM-DDTHH:mm:ss", "YYYY-MM-DD HH:mm", "YYYY-MM-DD"]) : null;
+          if (!last || !last.isValid()) {
+            // first time this device sees the schedule: start from now
+            await this.app.fileManager.processFrontMatter(t.file, (fm) => { fm[REPEAT_LAST_KEY] = now.format(SLOT_FORMAT); });
+            continue;
+          }
+          let due = [];
+          let s = nextRepeat(t.repeat, last);
+          while (s && !s.isAfter(now) && due.length < 1000) { due.push(s); s = nextRepeat(t.repeat, s); }
+          if (!due.length) continue;
+          const newest = due[due.length - 1];
+          if (String(t.fm[REPEAT_CATCHUP_KEY] || "").toLowerCase() === "latest") due = [newest];
+          else if (due.length > MAX_CATCH_UP) due = due.slice(-MAX_CATCH_UP);
+          if (!ids) ids = this.runIds();
+          for (const slot of due) {
+            const runId = `${db.name}/${t.name}@${slot.format(SLOT_FORMAT)}`;
+            if (ids.has(runId)) continue;
+            await this.create(db, t, { now: slot, open: "none", runId });
+            ids.add(runId);
+            made++;
+          }
+          await this.app.fileManager.processFrontMatter(t.file, (fm) => { fm[REPEAT_LAST_KEY] = newest.format(SLOT_FORMAT); });
+        }
+      }
+    } catch (e) {
+      console.error("[notion-style-kanban] repeating templates", e);
+      new obsidian.Notice("Repeating templates failed: " + (e && e.message ? e.message : e));
+    } finally {
+      this.running = false;
+    }
+    if (made) new obsidian.Notice(`Made ${made} note${made === 1 ? "" : "s"} from repeating templates`);
+    else if (manual) new obsidian.Notice("No repeating templates are due.");
+  }
+}
+
+class TemplatePickerModal extends obsidian.FuzzySuggestModal {
+  constructor(lib, items) {
+    super(lib.app);
+    this.lib = lib;
+    this.items = items;
+    this.setPlaceholder("New note from template…");
+  }
+  getItems() { return this.items; }
+  getItemText(it) { return `${it.db.name} › ${it.t ? it.t.name : "Empty page"}`; }
+  renderSuggestion(match, el) {
+    const it = match.item;
+    el.addClass("nk-tpl-suggestion");
+    const ic = el.createSpan({ cls: "nk-tpl-suggestion-icon" });
+    if (!(it.t && it.t.fm.icon && renderIconValue(ic, String(it.t.fm.icon)))) setIconSafe(ic, [it.t ? (it.t.repeat ? "repeat" : "file-text") : "file"]);
+    const body = el.createDiv({ cls: "nk-tpl-suggestion-body" });
+    body.createDiv({ text: it.t ? it.t.name : "Empty page" });
+    const sub = [it.db.name];
+    if (it.t && it.t.isDefault) sub.push("default");
+    if (it.t && it.t.repeat) sub.push(describeRepeat(it.t.repeat));
+    body.createDiv({ cls: "nk-tpl-suggestion-sub", text: sub.join(" · ") });
+  }
+  onChooseItem(it) {
+    this.lib.guard(() => this.lib.create(it.db, it.t, it.t ? {} : { title: "" }));
+  }
+}
+
+class TemplateManagerModal extends obsidian.Modal {
+  constructor(lib, db) {
+    super(lib.app);
+    this.lib = lib;
+    this.db = db;
+  }
+  onOpen() {
+    this.modalEl.addClass("nk-tpl-manager");
+    this.draw();
+    this.ref = this.app.metadataCache.on("changed", (f) => { if (f.path.startsWith(this.db.folderPath + "/")) this.drawSoon(); });
+    this.drawSoon = obsidian.debounce(() => this.draw(), 150, true);
+  }
+  onClose() {
+    if (this.ref) this.app.metadataCache.offref(this.ref);
+    this.contentEl.empty();
+  }
+  draw() {
+    const { contentEl } = this;
+    contentEl.empty();
+    this.titleEl.setText("Templates");
+    const top = new obsidian.Setting(contentEl).setName("Database").setDesc(`Templates are the notes in ${this.db.folderPath}/`);
+    const bases = this.app.vault.getFiles().filter((f) => f.extension === "base").sort((a, b) => a.basename.localeCompare(b.basename));
+    top.addDropdown((d) => {
+      for (const b of bases) d.addOption(b.path, b.basename);
+      d.setValue(this.db.base.path).onChange((v) => {
+        const bf = this.app.vault.getAbstractFileByPath(v);
+        if (bf instanceof obsidian.TFile) { this.db = this.lib.dbForBase(bf); this.draw(); }
+      });
+    });
+    top.addButton((b) => b.setButtonText("New template").setCta().onClick(async () => { this.close(); await this.lib.guard(() => this.lib.newTemplate(this.db)); }));
+
+    const list = this.lib.templates(this.db);
+    if (!list.length) contentEl.createDiv({ cls: "nk-tpl-empty", text: "No templates yet." });
+    const rowsEl = contentEl.createDiv({ cls: "nk-tpl-rows" });
+    for (const t of list) {
+      const row = new obsidian.Setting(rowsEl);
+      row.settingEl.addClass("nk-tpl-row");
+      const grip = row.settingEl.createDiv({ cls: "nk-tpl-grip", attr: { "aria-label": "Drag to reorder" } });
+      setIconSafe(grip, ["grip-vertical"]);
+      row.settingEl.prepend(grip);
+      this.makeDraggable(grip, row.settingEl, rowsEl, list, t);
+      const nameEl = row.nameEl;
+      nameEl.empty();
+      const ic = nameEl.createSpan({ cls: "nk-tpl-row-icon" });
+      if (!(t.fm.icon && renderIconValue(ic, String(t.fm.icon)))) setIconSafe(ic, ["file-text"]);
+      nameEl.createSpan({ text: t.name });
+      if (t.isDefault) nameEl.createSpan({ cls: "nk-tpl-badge", text: "Default" });
+      row.descEl.empty();
+      if (t.fm[TITLE_KEY]) row.descEl.createDiv({ text: `Title: ${t.fm[TITLE_KEY]}` });
+      if (t.repeat) row.descEl.createDiv({ cls: "nk-tpl-repeat-line", text: `↻ ${repeatSummary(t.repeat)}` });
+      row.addExtraButton((b) => b.setIcon("file-plus").setTooltip("New note from this template").onClick(() => { this.close(); this.lib.guard(() => this.lib.create(this.db, t)); }));
+      row.addExtraButton((b) => b.setIcon("pencil").setTooltip("Edit template").onClick(() => { this.close(); this.app.workspace.getLeaf("tab").openFile(t.file, { state: { mode: "source" } }); }));
+      row.addExtraButton((b) => {
+        b.setIcon("repeat").setTooltip(t.repeat ? `Repeat: ${describeRepeat(t.repeat)}` : "Repeat…").onClick(() => new RepeatModal(this.lib, t, () => this.draw()).open());
+        if (t.repeat) b.extraSettingsEl.addClass("nk-tpl-repeat-on");
+      });
+      row.addExtraButton((b) => b.setIcon(t.isDefault ? "star-off" : "star").setTooltip(t.isDefault ? "Stop using as default" : "Set as default").onClick(async () => { await this.lib.setDefault(this.db, t); window.setTimeout(() => this.draw(), 150); }));
+      row.addExtraButton((b) => b.setIcon("copy").setTooltip("Duplicate").onClick(async () => { await this.lib.guard(() => this.lib.duplicate(this.db, t)); window.setTimeout(() => this.draw(), 150); }));
+      row.addExtraButton((b) => b.setIcon("trash-2").setTooltip("Delete").onClick(() => {
+        new ConfirmModal(this.app, "Delete template", `Delete the template "${t.name}"? Notes made from it are kept.`, "Delete", async () => {
+          await this.app.vault.trash(t.file, true);
+          window.setTimeout(() => this.draw(), 150);
+        }).open();
+      }));
+    }
+  }
+  // pointer-based dragging (works with a mouse and on touch screens)
+  makeDraggable(grip, rowEl, rowsEl, list, t) {
+    grip.addEventListener("pointerdown", (ev) => {
+      if (ev.button !== 0) return;
+      ev.preventDefault();
+      const rows = Array.from(rowsEl.querySelectorAll(".nk-tpl-row"));
+      const from = rows.indexOf(rowEl);
+      let to = from;
+      rowEl.addClass("nk-tpl-dragging");
+      grip.setPointerCapture(ev.pointerId);
+      const others = rows.filter((r) => r !== rowEl);
+      // a line where the row will land: after the row above the new spot, or before the one below it
+      const mark = () => {
+        rows.forEach((r) => r.removeClass("nk-tpl-drop-before", "nk-tpl-drop-after"));
+        if (to === from) return;
+        if (to > 0) others[to - 1].addClass("nk-tpl-drop-after");
+        else others[0].addClass("nk-tpl-drop-before");
+      };
+      const move = (e) => {
+        // new position = how many of the other rows have their middle above the pointer
+        let k = 0;
+        for (const r of others) { const b = r.getBoundingClientRect(); if (e.clientY > b.top + b.height / 2) k++; }
+        to = k;
+        mark();
+      };
+      const up = async () => {
+        grip.removeEventListener("pointermove", move);
+        grip.removeEventListener("pointerup", up);
+        grip.removeEventListener("pointercancel", up);
+        rowEl.removeClass("nk-tpl-dragging");
+        rows.forEach((r) => r.removeClass("nk-tpl-drop-before", "nk-tpl-drop-after"));
+        if (to === from) return;
+        const next = list.slice();
+        const [moved] = next.splice(from, 1);
+        next.splice(to, 0, moved);
+        await this.lib.guard(() => this.lib.setOrder(next));
+        window.setTimeout(() => this.draw(), 150);
+      };
+      grip.addEventListener("pointermove", move);
+      grip.addEventListener("pointerup", up);
+      grip.addEventListener("pointercancel", up);
+    });
+  }
+}
+
+class RepeatModal extends obsidian.Modal {
+  constructor(lib, tpl, onDone) {
+    super(lib.app);
+    this.lib = lib;
+    this.tpl = tpl;
+    this.onDone = onDone;
+    const r = tpl.repeat;
+    this.r = r ? Object.assign({}, r, { days: [...r.days] }) : { freq: null, every: 1, days: [obsidian.moment().day()], monthDay: obsidian.moment().date(), month: obsidian.moment().month() + 1, time: "09:00", from: null };
+    this.catchUp = String(tpl.fm[REPEAT_CATCHUP_KEY] || "").toLowerCase() === "latest" ? "latest" : "all";
+  }
+  onOpen() {
+    this.modalEl.addClass("nk-repeat-modal");
+    this.titleEl.setText(`Repeat “${this.tpl.name}”`);
+    this.draw();
+  }
+  onClose() { this.contentEl.empty(); }
+  draw() {
+    const { contentEl } = this;
+    const r = this.r;
+    contentEl.empty();
+    new obsidian.Setting(contentEl).setName("Repeat").addDropdown((d) => {
+      d.addOption("", "Off").addOption("day", "Daily").addOption("weekdays", "Every weekday").addOption("week", "Weekly").addOption("month", "Monthly").addOption("year", "Yearly");
+      d.setValue(r.freq || "").onChange((v) => { r.freq = v || null; if (r.freq === "weekdays") r.every = 1; this.draw(); });
+    });
+    if (r.freq && r.freq !== "weekdays") {
+      const unit = { day: "days", week: "weeks", month: "months", year: "years" }[r.freq];
+      new obsidian.Setting(contentEl).setName("Every").setDesc(unit).addText((t) => {
+        t.inputEl.type = "number";
+        t.inputEl.min = "1";
+        t.inputEl.style.width = "5em";
+        t.setValue(String(r.every || 1)).onChange((v) => { r.every = Math.max(1, Number(v) || 1); this.preview(); });
+      });
+    }
+    if (r.freq === "week") {
+      const s = new obsidian.Setting(contentEl).setName("On");
+      const box = s.controlEl.createDiv({ cls: "nk-repeat-days" });
+      DAY_LABEL.forEach((label, i) => {
+        const b = box.createEl("button", { text: label, cls: r.days.includes(i) ? "is-on mod-cta" : "" });
+        b.onclick = () => {
+          r.days = r.days.includes(i) ? r.days.filter((d) => d !== i) : [...r.days, i].sort();
+          if (!r.days.length) r.days = [i];
+          this.draw();
+        };
+      });
+    }
+    if (r.freq === "month") {
+      new obsidian.Setting(contentEl).setName("On").addDropdown((d) => {
+        d.addOption("date", "Day of the month").addOption("weekday", "Weekday of the month");
+        d.setValue(r.weekOfMonth ? "weekday" : "date").onChange((v) => {
+          if (v === "weekday") { r.weekOfMonth = Math.min(4, Math.ceil(obsidian.moment().date() / 7)); r.weekday = obsidian.moment().day(); }
+          else r.weekOfMonth = null;
+          this.draw();
+        });
+      });
+      if (r.weekOfMonth) {
+        new obsidian.Setting(contentEl).setName("Which").addDropdown((d) => {
+          for (const k of [1, 2, 3, 4, 5]) d.addOption(String(k), ORDINALS[k]);
+          d.addOption("last", "Last");
+          d.setValue(String(r.weekOfMonth)).onChange((v) => { r.weekOfMonth = v === "last" ? "last" : Number(v); this.preview(); });
+        }).addDropdown((d) => {
+          DAY_LABEL.forEach((l, i) => d.addOption(String(i), l));
+          d.setValue(String(r.weekday)).onChange((v) => { r.weekday = Number(v); this.preview(); });
+        });
+      } else {
+        new obsidian.Setting(contentEl).setName("On day").addDropdown((d) => {
+          for (let i = 1; i <= 31; i++) d.addOption(String(i), String(i));
+          d.addOption("last", "Last day");
+          d.setValue(String(r.monthDay)).onChange((v) => { r.monthDay = v === "last" ? "last" : Number(v); this.preview(); });
+        });
+      }
+    }
+    if (r.freq === "year") {
+      new obsidian.Setting(contentEl).setName("On").addDropdown((d) => {
+        MONTH_ABBR.forEach((m, i) => d.addOption(String(i + 1), m));
+        d.setValue(String(r.month)).onChange((v) => { r.month = Number(v); this.preview(); });
+      }).addDropdown((d) => {
+        for (let i = 1; i <= 31; i++) d.addOption(String(i), String(i));
+        d.setValue(String(r.monthDay)).onChange((v) => { r.monthDay = Number(v); this.preview(); });
+      });
+    }
+    if (r.freq) {
+      new obsidian.Setting(contentEl).setName("Time").addText((t) => {
+        t.inputEl.type = "time";
+        t.setValue(r.time || "09:00").onChange((v) => { if (/^\d{2}:\d{2}$/.test(v)) { r.time = v; this.preview(); } });
+      });
+      if (r.freq !== "weekdays" && (Number(r.every) || 1) > 1) {
+        new obsidian.Setting(contentEl).setName("Starting").setDesc("Counts the weeks/months from this date").addText((t) => {
+          t.inputEl.type = "date";
+          t.setValue(r.from || obsidian.moment().format("YYYY-MM-DD")).onChange((v) => { r.from = v || null; this.preview(); });
+          if (!r.from) r.from = obsidian.moment().format("YYYY-MM-DD");
+        });
+      }
+      new obsidian.Setting(contentEl).setName("If Obsidian was closed").setDesc("When runs were missed because no device had Obsidian open").addDropdown((d) => {
+        d.addOption("all", "Make a note for every missed run").addOption("latest", "Only make the latest one");
+        d.setValue(this.catchUp).onChange((v) => { this.catchUp = v; });
+      });
+    }
+    this.previewEl = contentEl.createDiv({ cls: "nk-repeat-preview" });
+    this.preview();
+    new obsidian.Setting(contentEl)
+      .addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()))
+      .addButton((b) => b.setButtonText("Save").setCta().onClick(async () => {
+        await this.lib.guard(() => this.lib.setRepeat(this.tpl, r.freq ? r : null, this.catchUp));
+        this.close();
+        if (this.onDone) window.setTimeout(this.onDone, 150);
+      }));
+  }
+  preview() {
+    if (!this.previewEl) return;
+    this.previewEl.empty();
+    const r = this.r;
+    if (!r.freq) { this.previewEl.setText("This template doesn't repeat."); return; }
+    const rule = parseRepeat(repeatToString(r));
+    this.previewEl.createDiv({ text: describeRepeat(rule) });
+    const ul = this.previewEl.createEl("ul");
+    let at = obsidian.moment();
+    for (let i = 0; i < 3; i++) {
+      at = nextRepeat(rule, at);
+      if (!at) break;
+      ul.createEl("li", { text: at.format("dddd, MMM D, YYYY [at] h:mm A") });
     }
   }
 }
@@ -3608,6 +4634,32 @@ class CommentSettingTab extends obsidian.PluginSettingTab {
           this.plugin.comments.refreshSoon();
         })
       );
+
+    new obsidian.Setting(containerEl).setName("Templates").setHeading();
+    new obsidian.Setting(containerEl)
+      .setName("Templates folder")
+      .setDesc("Each base's templates are the notes in <this folder>/<base name>/, e.g. Templates/RM Tasks/.")
+      .addText((t) =>
+        t.setPlaceholder(TEMPLATES_ROOT).setValue(this.plugin.settings.templatesFolder || "").onChange(async (v) => {
+          this.plugin.settings.templatesFolder = v.trim();
+          await this.plugin.saveData(this.plugin.settings);
+          this.plugin.viewTabs.refreshAll();
+        })
+      );
+    new obsidian.Setting(containerEl)
+      .setName("Wait for sync before repeating (seconds)")
+      .setDesc("After Obsidian starts or comes back to the foreground, wait this long before making repeating-template notes, so sync can bring in ones another device already made.")
+      .addText((t) => {
+        t.inputEl.type = "number";
+        t.setPlaceholder("15").setValue(this.plugin.settings.repeatDelaySeconds === undefined ? "" : String(this.plugin.settings.repeatDelaySeconds)).onChange(async (v) => {
+          if (v.trim() === "") delete this.plugin.settings.repeatDelaySeconds;
+          else this.plugin.settings.repeatDelaySeconds = Math.max(0, Number(v) || 0);
+          await this.plugin.saveData(this.plugin.settings);
+        });
+      });
+    new obsidian.Setting(containerEl)
+      .setName("Manage templates")
+      .addButton((b) => b.setButtonText("Open").onClick(() => this.plugin.templates.openManager()));
   }
 }
 
@@ -3774,6 +4826,14 @@ class NotionStyleKanbanPlugin extends obsidian.Plugin {
 
     this.noteButtons = new NoteButtons(this);
     this.noteButtons.load();
+
+    this.templates = new TemplateLibrary(this);
+    this.templates.load();
+    this.register(() => this.templates.unload());
+    // the run id on notes made by repeating templates is bookkeeping: hide it like Notion would
+    if (!this.settings.propertyVisibility) this.settings.propertyVisibility = {};
+    if (!this.settings.propertyVisibility[RUN_KEY]) this.settings.propertyVisibility[RUN_KEY] = "hide";
+    if (!this.settings.propertyVisibility[ORDER_KEY]) this.settings.propertyVisibility[ORDER_KEY] = "hide";
 
     this.addCommand({
       id: "apply-notion-titles",
