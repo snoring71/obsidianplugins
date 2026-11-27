@@ -536,3 +536,29 @@
 .nk-hidden-toggle:hover { background: var(--background-modifier-hover); color: var(--text-muted); }
 .nk-hidden-toggle-icon { display: inline-flex; }
 .nk-hidden-toggle-icon svg { width: 14px; height: 14px; }
+
+/* ---------- Notion-style buttons in notes (```notion-button```) ---------- */
+.nk-note-button-wrap { margin: 2px 0; }
+.block-language-notion-button { margin: 0; }
+.nk-note-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 10px;
+  border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  box-shadow: none;
+  color: var(--text-normal);
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 80ms ease-in;
+}
+.nk-note-button:hover { background: var(--background-modifier-hover); }
+.nk-note-button:active { background: var(--background-modifier-active-hover, var(--background-modifier-hover)); }
+.nk-note-button:disabled { opacity: 0.5; cursor: default; }
+.nk-note-button-icon { display: inline-flex; align-items: center; font-size: 16px; }
+.nk-note-button-icon svg { width: 16px; height: 16px; }
+.nk-note-button-error { color: var(--text-error); font-size: 13px; }
