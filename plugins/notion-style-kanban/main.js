@@ -2330,6 +2330,42 @@ function expandBody(text, file, now) {
   return parts.map((p, i) => (i % 2 ? p : expandVars(p, file, now))).join("");
 }
 
+// .base text with templates excluded by its top-level filter; unchanged if already there or the filter is unusual
+function hideFolderInBase(text, folder) {
+  const cond = `file.inFolder(${JSON.stringify(folder)})`;
+  if (text.includes(cond)) return text;
+  const nl = text.includes("\r\n") ? "\r\n" : "\n";
+  const lines = text.split(/\r?\n/);
+  const block = ["    - not:", `        - '${cond.replace(/'/g, "''")}'`];
+  if (lines.some((l) => /^filters:\s*\S/.test(l))) return text; // one-line filter: leave it to the user
+  const f = lines.findIndex((l) => /^filters:\s*$/.test(l));
+  if (f < 0) {
+    // no filters yet: add one before the first top-level key (after leading comments)
+    let at = 0;
+    while (at < lines.length && (/^\s*#/.test(lines[at]) || !lines[at].trim())) at++;
+    lines.splice(at, 0, "filters:", "  and:", ...block);
+    return lines.join(nl);
+  }
+  if (!/^  and:\s*$/.test(lines[f + 1] || "")) {
+    // "filters: or" or a single expression: wrap what's there in an and-group with the new condition
+    let end = f + 1;
+    while (end < lines.length && (/^\s/.test(lines[end]) || !lines[end].trim())) end++;
+    const old = lines.slice(f + 1, end).filter((l) => l.trim());
+    if (!old.length) { lines.splice(f + 1, 0, "  and:", ...block); return lines.join(nl); }
+    if (old.length === 1 && !/^\s*(and|or|not):/.test(old[0])) {
+      lines.splice(f + 1, end - f - 1, "  and:", "    - " + old[0].trim().replace(/^-\s*/, ""), ...block);
+      return lines.join(nl);
+    }
+    lines.splice(f + 1, end - f - 1, "  and:", "    - " + old[0].trim(), ...old.slice(1).map((l) => "    " + l), ...block);
+    return lines.join(nl);
+  }
+  // after the last line of the existing and-list
+  let end = f + 2;
+  while (end < lines.length && /^ {4}/.test(lines[end])) end++;
+  lines.splice(end, 0, ...block);
+  return lines.join(nl);
+}
+
 // New notes start with a properties block, so a body that begins with a "---" divider isn't read as one
 function withPropertiesBlock(body) {
   return `---\n${TITLE_KEY}: ""\n---\n` + body;
@@ -3371,6 +3407,24 @@ class TemplateLibrary {
     p.registerEvent(this.app.metadataCache.on("changed", (f) => { if (f.path.startsWith(this.root + "/")) refresh(); }));
     p.registerEvent(this.app.vault.on("rename", refresh));
     this.app.workspace.onLayoutReady(refresh);
+    // template notes never show in a database's views (Notion keeps templates out of the table too)
+    this.app.workspace.onLayoutReady(() => window.setTimeout(() => this.hideTemplatesEverywhere(), 2000));
+  }
+
+  // ----- keep templates out of the bases -----
+
+  async hideTemplatesEverywhere() {
+    for (const db of this.databases()) await this.hideTemplatesIn(db.base);
+  }
+
+  // adds `not: file.inFolder("Templates")` to the base's top-level filters (all its views), once
+  async hideTemplatesIn(baseFile) {
+    if (!(baseFile instanceof obsidian.TFile)) return;
+    try {
+      await this.app.vault.process(baseFile, (text) => hideFolderInBase(text, this.root));
+    } catch (e) {
+      console.error("[notion-style-kanban] couldn't add the templates filter to " + baseFile.path, e);
+    }
   }
 
   // ----- template banner -----
@@ -3612,6 +3666,7 @@ class TemplateLibrary {
 
   async newTemplate(db, name) {
     await this.ensureFolder(db.folderPath);
+    await this.hideTemplatesIn(db.base);
     const path = uniqueNotePath(this.app, db.folderPath, safeFileName(name || "New template"));
     const file = await this.app.vault.create(path, "");
     await this.app.fileManager.processFrontMatter(file, (fm) => { fm[TITLE_KEY] = ""; });

@@ -1,4 +1,4 @@
-# Database templates (0.16.0)
+# Database templates (0.17.0)
 
 Notion-style templates for each database (each `.base` file), with a **New ▾** button, a template picker, a template manager and repeating templates.
 
@@ -6,7 +6,7 @@ Notion-style templates for each database (each `.base` file), with a **New ▾**
 
 A database's templates are the notes in `Templates/<base name>/`. For `Notion/RM Tasks/RM Tasks.base` that's `Templates/RM Tasks/`. Change the `Templates` root in Settings → Notion-style Kanban → Templates.
 
-Templates are ordinary notes. Their properties and content are copied into each new note. They have no `base` property, so they don't show on the boards. New notes go in the base's folder and get `base: "[[<base>.base]]"`.
+Templates are ordinary notes. Their properties and content are copied into each new note. They never show in a database's views: the plugin adds `not: file.inFolder("Templates")` to each database's top-level filter (on start-up and when you make a template), so a template can even have a `base` property. New notes go in the base's folder and get `base: "[[<base>.base]]"`.
 
 Template settings are stored as properties on the template, so they sync to every device:
 
