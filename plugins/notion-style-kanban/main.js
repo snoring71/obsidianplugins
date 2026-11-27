@@ -1144,6 +1144,26 @@ class PropertySchemas {
     return o ? o.color || "default" : null;
   }
 
+  get visibility() {
+    const s = this.plugin.settings;
+    if (!s.propertyVisibility || typeof s.propertyVisibility !== "object") s.propertyVisibility = {};
+    return s.propertyVisibility;
+  }
+
+  // "always" (default), "hide_if_empty" or "hide"
+  visibilityOf(prop) {
+    if (!prop) return "always";
+    const k = Object.keys(this.visibility).find((n) => sameText(n, prop));
+    return (k && this.visibility[k]) || "always";
+  }
+
+  async setVisibility(prop, mode) {
+    const k = Object.keys(this.visibility).find((n) => sameText(n, prop)) || prop;
+    if (!mode || mode === "always") delete this.visibility[k];
+    else this.visibility[k] = mode;
+    await this.save();
+  }
+
   iconOf(prop) {
     if (!prop) return "";
     const k = Object.keys(this.icons).find((n) => sameText(n, prop));
@@ -1367,6 +1387,7 @@ class OptionsPopover {
     if (this.el) this.el.remove();
     this.el = null;
     if (this.plugin.activeOptions === this) this.plugin.activeOptions = null;
+    if (this.plugin.propertyPanel) this.plugin.propertyPanel.refreshSoon();
   }
 
   // rows the keyboard can move through: matching options, then "Create …"
@@ -1565,12 +1586,15 @@ class PropertyPanel {
     this.app = plugin.app;
     this.schemas = plugin.schemas;
     this.refreshSoon = obsidian.debounce(() => this.refreshAll(), 40, true);
+    this.expanded = new Set(); // notes whose hidden properties are currently shown
   }
 
   load() {
     const p = this.plugin;
     p.registerEvent(this.app.workspace.on("layout-change", () => this.refreshSoon()));
     p.registerEvent(this.app.workspace.on("file-open", () => this.refreshSoon()));
+    // a property being edited stays visible until you click away from it
+    p.registerDomEvent(document, "focusout", () => window.setTimeout(() => this.refreshSoon(), 0));
     p.registerEvent(this.app.workspace.on("active-leaf-change", () => this.refreshSoon()));
     p.registerEvent(this.app.metadataCache.on("changed", () => this.refreshSoon()));
     p.registerEvent(this.app.workspace.on("nk:schema-changed", () => this.refreshSoon()));
@@ -1591,7 +1615,9 @@ class PropertyPanel {
 
   unload() {
     if (this.observer) this.observer.disconnect();
-    document.querySelectorAll(".nk-select-value, .nk-prop-icon").forEach((e) => e.remove());
+    document.querySelectorAll(".nk-select-value, .nk-prop-icon, .nk-hidden-toggle").forEach((e) => e.remove());
+    document.querySelectorAll(".nk-prop-hidden").forEach((e) => e.removeClass("nk-prop-hidden"));
+    document.querySelectorAll(".nk-show-hidden").forEach((e) => e.removeClass("nk-show-hidden"));
     document.querySelectorAll(".nk-managed, .nk-has-icon").forEach((e) => e.removeClass("nk-managed", "nk-has-icon"));
   }
 
@@ -1599,6 +1625,11 @@ class PropertyPanel {
     const menu = new obsidian.Menu();
     menu.addItem((i) => i.setTitle("Change icon").setIcon("smile-plus").onClick(() => this.pickIcon(prop, iconEl)));
     if (this.schemas.iconOf(prop)) menu.addItem((i) => i.setTitle("Remove icon").setIcon("x").onClick(() => this.schemas.setIcon(prop, null)));
+    menu.addSeparator();
+    const vis = this.schemas.visibilityOf(prop);
+    for (const [mode, title, icon] of [["always", "Always show", "eye"], ["hide_if_empty", "Hide when empty", "eye-off"], ["hide", "Always hide", "eye-off"]]) {
+      menu.addItem((i) => i.setTitle(title).setIcon(icon).setChecked(vis === mode).onClick(() => this.schemas.setVisibility(prop, mode)));
+    }
     menu.addSeparator();
     const cur = this.schemas.find(prop);
     const kind = cur ? cur.type : "";
@@ -1620,14 +1651,58 @@ class PropertyPanel {
     for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
       const view = leaf.view;
       if (!view || !view.file || !view.containerEl) continue;
-      view.containerEl.querySelectorAll(".metadata-property[data-property-key]").forEach((el) => this.decorate(el, view.file));
+      view.containerEl.querySelectorAll(".metadata-container").forEach((box) => {
+        box.querySelectorAll(".metadata-property[data-property-key]").forEach((el) => this.decorate(el, view.file));
+        this.renderHiddenToggle(box, view.file);
+      });
       if (this.observer) view.containerEl.querySelectorAll(".metadata-properties").forEach((h) => this.observer.observe(h, { childList: true, subtree: true }));
     }
+  }
+
+  isEmpty(v) {
+    if (v === undefined || v === null) return true;
+    if (Array.isArray(v)) return v.every((x) => this.isEmpty(x));
+    return typeof v === "string" && v.trim() === "";
+  }
+
+  renderHiddenToggle(box, file) {
+    const hidden = box.querySelectorAll(".metadata-property.nk-prop-hidden").length;
+    const open = this.expanded.has(file.path);
+    box.toggleClass("nk-show-hidden", open);
+    const list = box.querySelector(".metadata-properties");
+    let t = box.querySelector(".nk-hidden-toggle");
+    if (!hidden || !list) { if (t) t.remove(); return; }
+    const label = open ? `Hide ${hidden} propert${hidden === 1 ? "y" : "ies"}` : `${hidden} more propert${hidden === 1 ? "y" : "ies"}`;
+    if (t && t.dataset.label === label && t.previousElementSibling === list) return;
+    if (t) t.remove();
+    t = createDiv({ cls: "nk-hidden-toggle" });
+    list.insertAdjacentElement("afterend", t);
+    t.dataset.label = label;
+    setIconSafe(t.createSpan({ cls: "nk-hidden-toggle-icon" }), [open ? "chevron-up" : "chevron-down"]);
+    t.createSpan({ text: label });
+    t.onclick = (ev) => {
+      ev.preventDefault();
+      if (this.expanded.has(file.path)) this.expanded.delete(file.path);
+      else this.expanded.add(file.path);
+      this.refreshAll();
+    };
   }
 
   decorate(propEl, file) {
     const prop = propEl.dataset.propertyKey;
     if (!prop) return;
+
+    // visibility (Notion's "Always show" / "Hide when empty" / "Always hide")
+    const mode = this.schemas.visibilityOf(prop);
+    let hide = false;
+    if (mode === "hide") hide = true;
+    else if (mode === "hide_if_empty") {
+      const fm0 = (this.app.metadataCache.getFileCache(file) || {}).frontmatter || {};
+      const k0 = this.schemas.fmKey(fm0, prop);
+      hide = this.isEmpty(k0 ? fm0[k0] : undefined);
+    }
+    if (hide && (propEl.contains(document.activeElement) || (this.plugin.activeOptions && this.plugin.activeOptions.prop === prop))) hide = false;
+    if (propEl.hasClass("nk-prop-hidden") !== hide) propEl.toggleClass("nk-prop-hidden", hide);
 
     // icon
     const iconBox = propEl.querySelector(".metadata-property-icon");

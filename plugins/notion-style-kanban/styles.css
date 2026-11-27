@@ -518,3 +518,21 @@
 .nk-options-menu-icon svg, .nk-options-menu-check svg { width: 16px; height: 16px; }
 .nk-options-menu-check { margin-left: auto; display: inline-flex; }
 .nk-options-swatch { width: 18px; height: 18px; border-radius: 4px; background: rgba(var(--nk-rgb), 0.35); box-shadow: inset 0 0 0 1px rgba(var(--nk-rgb), 0.5); }
+
+/* ---------- property visibility ---------- */
+.metadata-container:not(.nk-show-hidden) .metadata-property.nk-prop-hidden { display: none !important; }
+.nk-hidden-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  margin: 2px 0;
+  border-radius: var(--radius-s, 4px);
+  color: var(--text-faint);
+  font-size: var(--metadata-label-font-size, 14px);
+  cursor: pointer;
+  user-select: none;
+}
+.nk-hidden-toggle:hover { background: var(--background-modifier-hover); color: var(--text-muted); }
+.nk-hidden-toggle-icon { display: inline-flex; }
+.nk-hidden-toggle-icon svg { width: 14px; height: 14px; }
