@@ -2330,6 +2330,11 @@ function expandBody(text, file, now) {
   return parts.map((p, i) => (i % 2 ? p : expandVars(p, file, now))).join("");
 }
 
+// New notes start with a properties block, so a body that begins with a "---" divider isn't read as one
+function withPropertiesBlock(body) {
+  return `---\n${TITLE_KEY}: ""\n---\n` + body;
+}
+
 // Template values: strings (and lists of strings) get the same variables as names
 function expandValue(v, file, now) {
   if (typeof v === "string") return expandVars(v, file, now);
@@ -2655,10 +2660,8 @@ class NoteButtons {
     }
     const text = await this.app.vault.read(t);
     const c = this.app.metadataCache.getFileCache(t);
-    const end = c && c.frontmatterPosition ? c.frontmatterPosition.end.offset : -1;
-    let body = text;
-    if (end >= 0) body = text.slice(end).replace(/^\s*---\s*\r?\n?/, "").replace(/^\r?\n/, "");
-    else body = text.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "");
+    // strip only the properties block: blank lines and "---" dividers right after it are content
+    const body = text.replace(/^\uFEFF?---[ \t]*\r?\n(?:[\s\S]*?\r?\n)?---[ \t]*(?:\r?\n|$)/, "");
     const fm = JSON.parse(JSON.stringify((c && c.frontmatter) || {}));
     return { fm, body };
   }
@@ -2674,7 +2677,7 @@ class NoteButtons {
     const tplName = tplPath ? String(tplPath).split("/").pop().replace(/\.md$/, "") : "";
     // Notion keeps the title as typed; the file gets a safe, unique name and the title goes in a property
     const title = expandVars(step.name || (asChild ? "Subtask" : titleOf(tpl.fm) || tplName || "Untitled"), from).replace(/\s+/g, " ").trim() || "Untitled";
-    const note = await this.app.vault.create(uniqueNotePath(this.app, folder, safeFileName(title)), expandBody(tpl.body || "", from));
+    const note = await this.app.vault.create(uniqueNotePath(this.app, folder, safeFileName(title)), withPropertiesBlock(expandBody(tpl.body || "", from)));
     await this.app.fileManager.processFrontMatter(note, (fm) => {
       for (const [k, v] of Object.entries(tpl.fm)) if (!skipTemplateKey(k)) fm[k] = expandValue(v, from);
       fm[TITLE_KEY] = title;
@@ -3177,6 +3180,7 @@ const REPEAT_KEY = "template-repeat";
 const REPEAT_LAST_KEY = "template-repeat-last";
 const REPEAT_CATCHUP_KEY = "template-repeat-catch-up";
 const DEFAULT_KEY = "template-default";
+const ORDER_KEY = "template-order";
 const SLOT_FORMAT = "YYYY-MM-DDTHH:mm";
 const MAX_CATCH_UP = 60;
 const DAY_ABBR = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
@@ -3254,6 +3258,12 @@ function repeatToString(r) {
 
 function formatTime(time) {
   return obsidian.moment(time || "09:00", "HH:mm").format("h:mm A");
+}
+
+// "Every month on day 1 at 7:00 AM · next Tue Dec 1, 7:00 AM"
+function repeatSummary(r) {
+  const next = r ? nextRepeat(r, obsidian.moment()) : null;
+  return `${describeRepeat(r)}${next ? ` · next ${next.format("ddd MMM D, h:mm A")}` : ""}`;
 }
 
 function describeRepeat(r) {
@@ -3354,6 +3364,61 @@ class TemplateLibrary {
     this.app.workspace.onLayoutReady(() => this.scheduleCheck());
     p.registerDomEvent(document, "visibilitychange", () => { if (document.visibilityState === "visible") this.scheduleCheck(); });
     p.registerInterval(window.setInterval(() => { if (Date.now() >= this.readyAt) this.runDue(false); }, 60 * 1000));
+    // "You're editing a template" banner on template notes
+    const refresh = obsidian.debounce(() => this.refreshBanners(), 100, true);
+    p.registerEvent(this.app.workspace.on("layout-change", refresh));
+    p.registerEvent(this.app.workspace.on("file-open", refresh));
+    p.registerEvent(this.app.metadataCache.on("changed", (f) => { if (f.path.startsWith(this.root + "/")) refresh(); }));
+    p.registerEvent(this.app.vault.on("rename", refresh));
+    this.app.workspace.onLayoutReady(refresh);
+  }
+
+  // ----- template banner -----
+
+  refreshBanners() {
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const view = leaf.view;
+      if (!view || !view.containerEl || !view.contentEl) continue;
+      const info = view.file ? this.templateInfo(view.file) : null;
+      let banner = view.containerEl.querySelector(":scope > .nk-tpl-banner");
+      if (!info) { if (banner) banner.remove(); continue; }
+      const sig = [info.db.name, info.t.file.path, info.t.fm[REPEAT_KEY] || "", info.t.isDefault].join("|");
+      if (banner && banner.dataset.sig === sig) continue;
+      if (banner) banner.remove();
+      banner = this.renderBanner(info);
+      banner.dataset.sig = sig;
+      view.containerEl.insertBefore(banner, view.contentEl);
+    }
+  }
+
+  removeBanners() {
+    document.querySelectorAll(".nk-tpl-banner").forEach((el) => el.remove());
+  }
+
+  renderBanner({ db, t }) {
+    const el = createDiv({ cls: "nk-tpl-banner" });
+    const inner = el.createDiv({ cls: "nk-tpl-banner-inner" });
+    inner.createSpan({ text: "You’re editing a template in" });
+    const link = inner.createEl("a", { cls: "nk-tpl-banner-db", href: "#" });
+    setIconSafe(link.createSpan({ cls: "nk-tpl-banner-db-icon" }), ["table-2", "table"]);
+    link.createSpan({ text: db.name });
+    link.addEventListener("click", (e) => { e.preventDefault(); this.app.workspace.getLeaf(false).openFile(db.base); });
+    const help = inner.createSpan({ cls: "nk-tpl-banner-help", attr: { "aria-label": "Changes here apply to new notes made from this template. Notes already made from it don't change." } });
+    setIconSafe(help, ["help-circle", "circle-help"]);
+    if (t.isDefault) inner.createSpan({ cls: "nk-tpl-banner-badge", text: "Default" });
+    const btn = inner.createEl("button", { cls: "nk-tpl-banner-repeat" + (t.repeat ? " is-on" : "") });
+    setIconSafe(btn.createSpan({ cls: "nk-tpl-banner-repeat-icon" }), ["repeat"]);
+    btn.createSpan({ text: t.repeat ? `Duplicate ${describeRepeat(t.repeat).replace(/^Every/, "every")}` : "Repeat" });
+    setIconSafe(btn.createSpan({ cls: "nk-tpl-banner-chevron" }), ["chevron-down"]);
+    if (t.repeat) {
+      const next = nextRepeat(t.repeat, obsidian.moment());
+      if (next) btn.setAttr("aria-label", `Next: ${next.format("ddd MMM D, h:mm A")}`);
+    }
+    btn.addEventListener("click", () => {
+      const fresh = this.templateInfo(t.file);
+      new RepeatModal(this, fresh ? fresh.t : t, () => this.refreshBanners()).open();
+    });
+    return el;
   }
 
   scheduleCheck() {
@@ -3365,6 +3430,7 @@ class TemplateLibrary {
 
   unload() {
     if (this.timer) window.clearTimeout(this.timer);
+    this.removeBanners();
   }
 
   // ----- databases and their templates -----
@@ -3407,8 +3473,35 @@ class TemplateLibrary {
     const name = (f) => f.path.slice(prefix.length).replace(/\.md$/, "");
     return list
       .map((f) => ({ file: f, name: name(f), fm: this.fm(f) }))
-      .map((t) => Object.assign(t, { isDefault: t.fm[DEFAULT_KEY] === true || String(t.fm[DEFAULT_KEY]).toLowerCase() === "true", repeat: parseRepeat(t.fm[REPEAT_KEY]) }))
-      .sort((a, b) => (b.isDefault - a.isDefault) || a.name.localeCompare(b.name));
+      .map((t) => Object.assign(t, {
+        isDefault: t.fm[DEFAULT_KEY] === true || String(t.fm[DEFAULT_KEY]).toLowerCase() === "true",
+        repeat: parseRepeat(t.fm[REPEAT_KEY]),
+        order: Number.isFinite(Number(t.fm[ORDER_KEY])) && t.fm[ORDER_KEY] !== null && t.fm[ORDER_KEY] !== "" ? Number(t.fm[ORDER_KEY]) : Infinity,
+      }))
+      // the order set by dragging in Manage templates; templates never placed go last, default first
+      .sort((a, b) => (a.order === b.order ? 0 : a.order < b.order ? -1 : 1) || (b.isDefault - a.isDefault) || a.name.localeCompare(b.name));
+  }
+
+  // Manage templates drag-and-drop: write 1..n to template-order (only where it changed)
+  async setOrder(list) {
+    for (let i = 0; i < list.length; i++) {
+      const t = list[i];
+      if (t.order === i + 1) continue;
+      await this.app.fileManager.processFrontMatter(t.file, (fm) => { fm[ORDER_KEY] = i + 1; });
+    }
+  }
+
+  // the database and template entry for a template note (null if the note isn't one)
+  templateInfo(file) {
+    if (!(file instanceof obsidian.TFile) || file.extension !== "md") return null;
+    const root = this.root + "/";
+    if (!file.path.startsWith(root)) return null;
+    const dbName = file.path.slice(root.length).split("/")[0];
+    const base = this.app.vault.getFiles().find((f) => f.extension === "base" && f.basename === dbName);
+    if (!base) return null;
+    const db = this.dbForBase(base);
+    const t = this.templates(db).find((x) => x.file.path === file.path);
+    return t ? { db, t } : null;
   }
 
   defaultTemplate(db) {
@@ -3430,7 +3523,7 @@ class TemplateLibrary {
     const title = expandVars(rawTitle, null, now).replace(/\s+/g, " ").trim();
     const folder = db.notesFolder;
     if (folder && !this.app.vault.getAbstractFileByPath(folder)) await this.app.vault.createFolder(folder);
-    const note = await this.app.vault.create(uniqueNotePath(this.app, folder, safeFileName(title || "Untitled")), expandBody(read.body || "", null, now));
+    const note = await this.app.vault.create(uniqueNotePath(this.app, folder, safeFileName(title || "Untitled")), withPropertiesBlock(expandBody(read.body || "", null, now)));
     await this.app.fileManager.processFrontMatter(note, (fm) => {
       for (const [k, v] of Object.entries(read.fm)) if (!skipTemplateKey(k)) fm[k] = expandValue(v, null, now);
       fm[TITLE_KEY] = title;
@@ -3680,25 +3773,29 @@ class TemplateManagerModal extends obsidian.Modal {
 
     const list = this.lib.templates(this.db);
     if (!list.length) contentEl.createDiv({ cls: "nk-tpl-empty", text: "No templates yet." });
+    const rowsEl = contentEl.createDiv({ cls: "nk-tpl-rows" });
     for (const t of list) {
-      const row = new obsidian.Setting(contentEl);
+      const row = new obsidian.Setting(rowsEl);
       row.settingEl.addClass("nk-tpl-row");
+      const grip = row.settingEl.createDiv({ cls: "nk-tpl-grip", attr: { "aria-label": "Drag to reorder" } });
+      setIconSafe(grip, ["grip-vertical"]);
+      row.settingEl.prepend(grip);
+      this.makeDraggable(grip, row.settingEl, rowsEl, list, t);
       const nameEl = row.nameEl;
       nameEl.empty();
       const ic = nameEl.createSpan({ cls: "nk-tpl-row-icon" });
       if (!(t.fm.icon && renderIconValue(ic, String(t.fm.icon)))) setIconSafe(ic, ["file-text"]);
       nameEl.createSpan({ text: t.name });
       if (t.isDefault) nameEl.createSpan({ cls: "nk-tpl-badge", text: "Default" });
-      const desc = [];
-      if (t.fm[TITLE_KEY]) desc.push(`Title: ${t.fm[TITLE_KEY]}`);
-      if (t.repeat) {
-        const next = nextRepeat(t.repeat, obsidian.moment());
-        desc.push(`↻ ${describeRepeat(t.repeat)}${next ? ` · next ${next.format("ddd MMM D, h:mm A")}` : ""}`);
-      }
-      row.setDesc(desc.join("  ·  "));
+      row.descEl.empty();
+      if (t.fm[TITLE_KEY]) row.descEl.createDiv({ text: `Title: ${t.fm[TITLE_KEY]}` });
+      if (t.repeat) row.descEl.createDiv({ cls: "nk-tpl-repeat-line", text: `↻ ${repeatSummary(t.repeat)}` });
       row.addExtraButton((b) => b.setIcon("file-plus").setTooltip("New note from this template").onClick(() => { this.close(); this.lib.guard(() => this.lib.create(this.db, t)); }));
       row.addExtraButton((b) => b.setIcon("pencil").setTooltip("Edit template").onClick(() => { this.close(); this.app.workspace.getLeaf("tab").openFile(t.file, { state: { mode: "source" } }); }));
-      row.addExtraButton((b) => b.setIcon("repeat").setTooltip("Repeat…").onClick(() => new RepeatModal(this.lib, t, () => this.draw()).open()));
+      row.addExtraButton((b) => {
+        b.setIcon("repeat").setTooltip(t.repeat ? `Repeat: ${describeRepeat(t.repeat)}` : "Repeat…").onClick(() => new RepeatModal(this.lib, t, () => this.draw()).open());
+        if (t.repeat) b.extraSettingsEl.addClass("nk-tpl-repeat-on");
+      });
       row.addExtraButton((b) => b.setIcon(t.isDefault ? "star-off" : "star").setTooltip(t.isDefault ? "Stop using as default" : "Set as default").onClick(async () => { await this.lib.setDefault(this.db, t); window.setTimeout(() => this.draw(), 150); }));
       row.addExtraButton((b) => b.setIcon("copy").setTooltip("Duplicate").onClick(async () => { await this.lib.guard(() => this.lib.duplicate(this.db, t)); window.setTimeout(() => this.draw(), 150); }));
       row.addExtraButton((b) => b.setIcon("trash-2").setTooltip("Delete").onClick(() => {
@@ -3708,6 +3805,49 @@ class TemplateManagerModal extends obsidian.Modal {
         }).open();
       }));
     }
+  }
+  // pointer-based dragging (works with a mouse and on touch screens)
+  makeDraggable(grip, rowEl, rowsEl, list, t) {
+    grip.addEventListener("pointerdown", (ev) => {
+      if (ev.button !== 0) return;
+      ev.preventDefault();
+      const rows = Array.from(rowsEl.querySelectorAll(".nk-tpl-row"));
+      const from = rows.indexOf(rowEl);
+      let to = from;
+      rowEl.addClass("nk-tpl-dragging");
+      grip.setPointerCapture(ev.pointerId);
+      const others = rows.filter((r) => r !== rowEl);
+      // a line where the row will land: after the row above the new spot, or before the one below it
+      const mark = () => {
+        rows.forEach((r) => r.removeClass("nk-tpl-drop-before", "nk-tpl-drop-after"));
+        if (to === from) return;
+        if (to > 0) others[to - 1].addClass("nk-tpl-drop-after");
+        else others[0].addClass("nk-tpl-drop-before");
+      };
+      const move = (e) => {
+        // new position = how many of the other rows have their middle above the pointer
+        let k = 0;
+        for (const r of others) { const b = r.getBoundingClientRect(); if (e.clientY > b.top + b.height / 2) k++; }
+        to = k;
+        mark();
+      };
+      const up = async () => {
+        grip.removeEventListener("pointermove", move);
+        grip.removeEventListener("pointerup", up);
+        grip.removeEventListener("pointercancel", up);
+        rowEl.removeClass("nk-tpl-dragging");
+        rows.forEach((r) => r.removeClass("nk-tpl-drop-before", "nk-tpl-drop-after"));
+        if (to === from) return;
+        const next = list.slice();
+        const [moved] = next.splice(from, 1);
+        next.splice(to, 0, moved);
+        await this.lib.guard(() => this.lib.setOrder(next));
+        window.setTimeout(() => this.draw(), 150);
+      };
+      grip.addEventListener("pointermove", move);
+      grip.addEventListener("pointerup", up);
+      grip.addEventListener("pointercancel", up);
+    });
   }
 }
 
@@ -4638,6 +4778,7 @@ class NotionStyleKanbanPlugin extends obsidian.Plugin {
     // the run id on notes made by repeating templates is bookkeeping: hide it like Notion would
     if (!this.settings.propertyVisibility) this.settings.propertyVisibility = {};
     if (!this.settings.propertyVisibility[RUN_KEY]) this.settings.propertyVisibility[RUN_KEY] = "hide";
+    if (!this.settings.propertyVisibility[ORDER_KEY]) this.settings.propertyVisibility[ORDER_KEY] = "hide";
 
     this.addCommand({
       id: "apply-notion-titles",

@@ -1,4 +1,4 @@
-# Database templates (0.15.0)
+# Database templates (0.16.0)
 
 Notion-style templates for each database (each `.base` file), with a **New ▾** button, a template picker, a template manager and repeating templates.
 
@@ -14,12 +14,13 @@ Template settings are stored as properties on the template, so they sync to ever
 | --- | --- |
 | `title` | Title of new notes. Can use variables, e.g. `RM Standup {{today:YYYY-MM-DD}}`. Empty means "Untitled" with the title selected for typing |
 | `icon` | Page icon of new notes |
+| `template-order` | Position in the template lists (set by dragging in Manage templates; hidden) |
 | `template-default: true` | The default template (Notion's "Default"). Used by **New** and by the board's "+ New" in a column |
 | `template-repeat` | Repeat schedule (see below) |
 | `template-repeat-last` | Last run that was made (written by the plugin) |
 | `template-repeat-catch-up: latest` | After missed runs, make only the newest one |
 
-Properties starting with `template-` are not copied to new notes. Variables (`{{today}}`, `{{now}}`, `{{next:tue}}` …, see [notion-buttons.md](notion-buttons.md#variables)) are filled in when the note is made, except inside `notion-button` blocks, which keep them for when the button is clicked.
+Properties starting with `template-` are not copied to new notes. Everything else in the template body is copied as-is, including blank lines and `---` dividers. Variables (`{{today}}`, `{{now}}`, `{{next:tue}}` …, see [notion-buttons.md](notion-buttons.md#variables)) are filled in when the note is made, except inside `notion-button` blocks, which keep them for when the button is clicked.
 
 ## Making a note
 
@@ -30,6 +31,12 @@ Properties starting with `template-` are not copied to new notes. Variables (`{{
 ## Managing templates
 
 Command **Manage templates**, or **Manage templates…** in the New menu. Pick a database, then for each template: make a note, edit, set repeat, make default (star), duplicate, delete. **New template** creates an empty one and opens it.
+
+Drag a template by its grip (⋮⋮) to reorder. The New menu and the New note from template list use the same order. Templates you never placed go last, the default first. The repeat icon is blue for templates that repeat, and their schedule and next run show on the line under the title.
+
+## Template banner
+
+A template note shows a banner at the top ("You're editing a template in <database>") that stays put while you scroll. Click the database name to open the board, or the repeat button to change the schedule.
 
 ## Repeating templates
 
