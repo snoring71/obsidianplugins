@@ -1902,6 +1902,286 @@ class ViewTabsBar {
   }
 }
 
+// ---------- Notion-style comments under the properties ----------
+//
+// Comments live in the note body, right after the frontmatter, as callouts:
+//   > [!comment|page] Comment                 (page comments, one thread)
+//   > [!comment] On “highlighted text”         (an imported inline comment thread)
+//   > **Name** · Dec 12, 2025, 1:43 PM
+//   > comment text
+//   >
+//   > **Name** · ...
+// The panel shows them Notion-style and hides the raw callouts; without the
+// plugin they still read fine as ordinary callouts.
+
+const COMMENT_TIME_FORMAT = "MMM D, YYYY, h:mm A";
+const COMMENT_HEAD_RE = /^\*\*(.+?)\*\* · (.+)$/;
+const CALLOUT_START_RE = /^>\s*\[!comment(?:\|([^\]]*))?\][+-]?\s*(.*)$/i;
+
+function splitFrontmatter(text) {
+  const m = /^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/.exec(text);
+  return m ? m[0].length : 0;
+}
+
+// Find the run of comment callouts at the top of the body.
+// Returns { bodyStart, start, end, threads:[{ kind, title, lineStart, lineEnd, comments:[{author, time, text, lineStart, lineEnd}] }] }
+// where line numbers index into `lines` (the whole file split on \n).
+function parseComments(text) {
+  const lines = text.split("\n");
+  const fmLen = splitFrontmatter(text);
+  let i = fmLen ? text.slice(0, fmLen).split("\n").length - 1 : 0;
+  if (fmLen && !text.slice(0, fmLen).endsWith("\n")) i += 1;
+  const bodyStart = i;
+  const threads = [];
+  let j = i;
+  while (j < lines.length && lines[j].trim() === "") j++;
+  const start = j;
+  let end = start;
+  while (j < lines.length) {
+    const m = CALLOUT_START_RE.exec(lines[j].replace(/\r$/, ""));
+    if (!m) break;
+    const meta = (m[1] || "").trim().toLowerCase();
+    const t = { kind: meta === "page" ? "page" : "inline", title: m[2].trim(), lineStart: j, comments: [] };
+    j++;
+    let cur = null;
+    while (j < lines.length && /^>/.test(lines[j])) {
+      const raw = lines[j].replace(/\r$/, "").replace(/^>\s?/, "");
+      const h = COMMENT_HEAD_RE.exec(raw.trim());
+      if (h) {
+        cur = { author: h[1], time: h[2], body: [], lineStart: j, lineEnd: j + 1 };
+        t.comments.push(cur);
+      } else if (cur) {
+        cur.body.push(raw);
+        cur.lineEnd = j + 1;
+      }
+      j++;
+    }
+    t.lineEnd = j;
+    for (const c of t.comments) {
+      c.text = c.body.join("\n").trim();
+      delete c.body;
+    }
+    threads.push(t);
+    end = j;
+    while (j < lines.length && lines[j].trim() === "") j++;
+  }
+  return { lines, bodyStart, start, end, threads };
+}
+
+function quoteLines(text) {
+  return text.split(/\r?\n/).map((l) => (l ? "> " + l : ">"));
+}
+
+function initials(name) {
+  const parts = String(name || "?").trim().split(/\s+/);
+  return ((parts[0] || "?")[0] + (parts.length > 1 ? parts[parts.length - 1][0] : "")).toUpperCase();
+}
+
+class CommentsPanel {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.app = plugin.app;
+    this.refreshSoon = obsidian.debounce(() => this.refreshAll(), 80, true);
+  }
+
+  get author() {
+    return (this.plugin.settings.commentAuthor || "").trim() || "Me";
+  }
+
+  load() {
+    const p = this.plugin;
+    p.registerEvent(this.app.workspace.on("layout-change", () => this.refreshSoon()));
+    p.registerEvent(this.app.workspace.on("file-open", () => this.refreshSoon()));
+    p.registerEvent(this.app.workspace.on("active-leaf-change", () => this.refreshSoon()));
+    p.registerEvent(this.app.vault.on("modify", (f) => { if (f.extension === "md") this.refreshSoon(); }));
+    this.observer = new MutationObserver(() => this.refreshSoon());
+    this.app.workspace.onLayoutReady(() => this.refreshAll());
+    document.body.classList.add("nk-comments-on");
+  }
+
+  unload() {
+    if (this.observer) this.observer.disconnect();
+    document.body.classList.remove("nk-comments-on");
+    document.querySelectorAll(".nk-comments").forEach((e) => {
+      if (e._nkComponent) e._nkComponent.unload();
+      e.remove();
+    });
+  }
+
+  refreshAll() {
+    if (this.observer) this.observer.disconnect();
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const view = leaf.view;
+      if (!view || !view.file || !view.containerEl) continue;
+      this.renderInView(view);
+      if (this.observer) {
+        view.containerEl.querySelectorAll(".markdown-preview-sizer, .cm-sizer, .mod-header").forEach((h) => this.observer.observe(h, { childList: true }));
+      }
+    }
+  }
+
+  async renderInView(view) {
+    const file = view.file;
+    let text;
+    try {
+      text = await this.app.vault.cachedRead(file);
+    } catch (e) {
+      return;
+    }
+    const parsed = parseComments(text);
+    const key = file.path + "\u0000" + this.author + "\u0000" + JSON.stringify(parsed.threads.map((t) => [t.kind, t.title, t.comments]));
+    const hosts = view.containerEl.querySelectorAll(".markdown-source-view .cm-sizer, .markdown-preview-view .markdown-preview-sizer");
+    hosts.forEach((host) => {
+      const header = host.querySelector(":scope > .mod-header") || host;
+      const meta = header.querySelector(":scope > .metadata-container");
+      const before = meta ? meta.nextSibling : header.querySelector(":scope > .cm-contentContainer");
+      let panel = header.querySelector(":scope > .nk-comments");
+      if (!panel || (meta && panel.previousSibling !== meta)) {
+        if (panel) panel.remove();
+        panel = createDiv({ cls: "nk-comments" });
+        header.insertBefore(panel, before || null);
+        panel.dataset.key = "";
+      }
+      if (panel.dataset.key === key) return;
+      // keep an unsent draft if the panel re-renders
+      const draftEl = panel.querySelector(".nk-comment-input");
+      const draft = draftEl && panel.dataset.path === file.path ? draftEl.value : "";
+      panel.dataset.key = key;
+      panel.dataset.path = file.path;
+      this.renderPanel(panel, file, parsed, draft);
+    });
+  }
+
+  renderPanel(panel, file, parsed, draft) {
+    if (panel._nkComponent) panel._nkComponent.unload();
+    const comp = new obsidian.Component();
+    comp.load();
+    panel._nkComponent = comp;
+    panel.empty();
+    const pageThreads = parsed.threads.filter((t) => t.kind === "page");
+    const inline = parsed.threads.filter((t) => t.kind !== "page");
+
+    const list = panel.createDiv({ cls: "nk-comments-list" });
+    const renderComment = (parent, c, thread, idx) => {
+      const row = parent.createDiv({ cls: "nk-comment" });
+      row.createDiv({ cls: "nk-comment-avatar", text: initials(c.author) });
+      const main = row.createDiv({ cls: "nk-comment-main" });
+      const head = main.createDiv({ cls: "nk-comment-head" });
+      head.createSpan({ cls: "nk-comment-author", text: c.author });
+      head.createSpan({ cls: "nk-comment-time", text: c.time });
+      const del = head.createSpan({ cls: "nk-comment-delete", attr: { "aria-label": "Delete comment" } });
+      setIconSafe(del, ["trash-2", "trash"]);
+      del.onclick = (ev) => {
+        ev.preventDefault();
+        new ConfirmModal(this.app, "Delete comment", "Delete this comment from the note?", "Delete", () => this.deleteComment(file, thread, idx)).open();
+      };
+      const body = main.createDiv({ cls: "nk-comment-body markdown-rendered" });
+      obsidian.MarkdownRenderer.render(this.app, c.text, body, file.path, comp);
+    };
+    for (const t of pageThreads) t.comments.forEach((c, i) => renderComment(list, c, t, i));
+    for (const t of inline) {
+      const box = list.createDiv({ cls: "nk-comment-thread" });
+      const q = t.title.replace(/^On\s+/, "").replace(/^[“"]|[”"]$/g, "");
+      if (q) box.createDiv({ cls: "nk-comment-quote", text: q });
+      t.comments.forEach((c, i) => renderComment(box, c, t, i));
+    }
+
+    const add = panel.createDiv({ cls: "nk-comment nk-comment-add" });
+    add.createDiv({ cls: "nk-comment-avatar", text: initials(this.author) });
+    const input = add.createEl("textarea", { cls: "nk-comment-input", attr: { rows: "1", placeholder: "Add a comment..." } });
+    input.value = draft || "";
+    const send = add.createDiv({ cls: "nk-comment-send", attr: { "aria-label": "Send" } });
+    setIconSafe(send, ["arrow-up-circle", "circle-arrow-up", "send"]);
+    const grow = () => {
+      input.style.height = "auto";
+      input.style.height = input.scrollHeight + "px";
+      add.toggleClass("has-text", !!input.value.trim());
+    };
+    const submit = async () => {
+      const value = input.value.trim();
+      if (!value) return;
+      input.value = "";
+      grow();
+      await this.addComment(file, value);
+    };
+    input.addEventListener("input", grow);
+    input.addEventListener("keydown", (ev) => {
+      ev.stopPropagation();
+      if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) {
+        ev.preventDefault();
+        submit();
+      }
+    });
+    send.onclick = (ev) => { ev.preventDefault(); submit(); };
+    window.setTimeout(grow, 0);
+  }
+
+  async addComment(file, value) {
+    const head = `> **${this.author}** · ${window.moment().format(COMMENT_TIME_FORMAT)}`;
+    const newLines = [head, ...quoteLines(value)];
+    await this.app.vault.process(file, (text) => {
+      const p = parseComments(text);
+      const lines = p.lines;
+      const page = p.threads.filter((t) => t.kind === "page").pop();
+      if (page) {
+        lines.splice(page.lineEnd, 0, ">", ...newLines);
+      } else {
+        const block = ["> [!comment|page] Comment", ...newLines, ""];
+        const at = p.threads.length ? p.start : p.bodyStart;
+        // one blank line between the comments and the page content
+        if (at < lines.length && lines[at].trim() === "") block.pop();
+        lines.splice(at, 0, ...block);
+      }
+      return lines.join("\n");
+    });
+  }
+
+  async deleteComment(file, thread, idx) {
+    await this.app.vault.process(file, (text) => {
+      const p = parseComments(text);
+      const t = p.threads.find((x) => x.lineStart === thread.lineStart && x.title === thread.title);
+      if (!t || !t.comments[idx]) return text;
+      const lines = p.lines;
+      if (t.comments.length === 1) {
+        let endLine = t.lineEnd;
+        while (endLine < lines.length && lines[endLine].trim() === "") endLine++;
+        lines.splice(t.lineStart, endLine - t.lineStart);
+      } else {
+        const c = t.comments[idx];
+        let s = c.lineStart;
+        // drop the blank ">" separator before this comment (or after, for the first one)
+        if (idx > 0 && /^>\s*$/.test(lines[s - 1])) s--;
+        let e = c.lineEnd;
+        if (idx === 0 && /^>\s*$/.test(lines[e] || "")) e++;
+        lines.splice(s, e - s);
+      }
+      return lines.join("\n");
+    });
+  }
+}
+
+class CommentSettingTab extends obsidian.PluginSettingTab {
+  constructor(app, plugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+
+  display() {
+    const { containerEl } = this;
+    containerEl.empty();
+    new obsidian.Setting(containerEl)
+      .setName("Comment author name")
+      .setDesc("Shown above comments you add with “Add a comment...”.")
+      .addText((t) =>
+        t.setPlaceholder("Your name").setValue(this.plugin.settings.commentAuthor || "").onChange(async (v) => {
+          this.plugin.settings.commentAuthor = v;
+          await this.plugin.saveData(this.plugin.settings);
+          this.plugin.comments.refreshSoon();
+        })
+      );
+  }
+}
+
 class NotionStyleKanbanPlugin extends obsidian.Plugin {
   openOptions(file, prop, anchorEl) {
     if (this.activeOptions) this.activeOptions.close();
@@ -1939,6 +2219,11 @@ class NotionStyleKanbanPlugin extends obsidian.Plugin {
     this.noteIcons = new NoteIconHeader(this);
     this.noteIcons.load();
     this.register(() => this.noteIcons.unload());
+
+    this.comments = new CommentsPanel(this);
+    this.comments.load();
+    this.register(() => this.comments.unload());
+    this.addSettingTab(new CommentSettingTab(this.app, this));
 
     this.viewTabs = new ViewTabsBar(this);
     this.viewTabs.load();
