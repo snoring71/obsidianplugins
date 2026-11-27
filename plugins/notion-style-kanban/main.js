@@ -3217,6 +3217,85 @@ const REPEAT_LAST_KEY = "template-repeat-last";
 const REPEAT_CATCHUP_KEY = "template-repeat-catch-up";
 const DEFAULT_KEY = "template-default";
 const ORDER_KEY = "template-order";
+// notes the Notion importer made from database templates (2026-11-25 import); replaced by Templates/<database>/
+const IMPORTED_TEMPLATE_COPIES = [
+  "Notion/Backup Strategy/Backup Strategy GitHub.md",
+  "Notion/Backup Strategy/Backup Strategy Google Drive.md",
+  "Notion/Backup Strategy/Backup Strategy WD My Passport USB Drive.md",
+  "Notion/Backup Tasks/Backup Tasks New Backup Configuration.md",
+  "Notion/Backup Tasks/Backup Tasks New Non-Steam Game Save Data Backup (Steam Deck).md",
+  "Notion/Backup Tasks/Backup Tasks Scheduled FreeFileSync Backup @Today.md",
+  "Notion/Backup Tasks/Backup Tasks Scheduled Steam Deck Backup @Today.md",
+  "Notion/Notes Database/Notes Database 1-1 Meeting.md",
+  "Notion/Notes Database/Notes Database CCB Meeting.md",
+  "Notion/Notes Database/Notes Database Card Processing Alignment.md",
+  "Notion/Notes Database/Notes Database Default.md",
+  "Notion/Notes Database/Notes Database MB Standup.md",
+  "Notion/Notes Database/Notes Database Octopus Review.md",
+  "Notion/Notes Database/Notes Database Product Development Lifecycle.md",
+  "Notion/Notes Database/Notes Database Production Meeting.md",
+  "Notion/Notes Database/Notes Database RM Grooming.md",
+  "Notion/Notes Database/Notes Database RM Review (Monthly).md",
+  "Notion/Notes Database/Notes Database RM Sprint Review.md",
+  "Notion/Notes Database/Notes Database RM Standup.md",
+  "Notion/Notes Database/Notes Database Regulatory Work Items.md",
+  "Notion/Notes Database/Notes Database Release Planning.md",
+  "Notion/Notes Database/Notes Database SPR Review & Approval.md",
+  "Notion/RM Tasks/RM Tasks APCS Release Planning.md",
+  "Notion/RM Tasks/RM Tasks Azul Zulu JRE New Version testing (deprecated).md",
+  "Notion/RM Tasks/RM Tasks Azul Zulu JRE New Version testing.md",
+  "Notion/RM Tasks/RM Tasks Backlog-Blocked Item Grooming @Today.md",
+  "Notion/RM Tasks/RM Tasks Button Automation Library.md",
+  "Notion/RM Tasks/RM Tasks Chef Testing - Expedited.md",
+  "Notion/RM Tasks/RM Tasks Chef Testing - New Cookbook.md",
+  "Notion/RM Tasks/RM Tasks Chef.Cookbook.md",
+  "Notion/RM Tasks/RM Tasks Chef.Profile.Waivers Testing.md",
+  "Notion/RM Tasks/RM Tasks Chef.Profile.~ Testing.md",
+  "Notion/RM Tasks/RM Tasks Customer communication.md",
+  "Notion/RM Tasks/RM Tasks Documentation and Learning.md",
+  "Notion/RM Tasks/RM Tasks End of Sales-End of Support.md",
+  "Notion/RM Tasks/RM Tasks Expedite.md",
+  "Notion/RM Tasks/RM Tasks Eyecon Quarterly Update.md",
+  "Notion/RM Tasks/RM Tasks FO Data Testing.md",
+  "Notion/RM Tasks/RM Tasks General Testing.md",
+  "Notion/RM Tasks/RM Tasks Merge Day Feature Flag Check -.md",
+  "Notion/RM Tasks/RM Tasks New SPC Release (Tasks 1-4).md",
+  "Notion/RM Tasks/RM Tasks New feature flag.md",
+  "Notion/RM Tasks/RM Tasks New iOS release review-testing (deprecated 2).md",
+  "Notion/RM Tasks/RM Tasks New iOS release review-testing.md",
+  "Notion/RM Tasks/RM Tasks New iOS release test (Deprecated).md",
+  "Notion/RM Tasks/RM Tasks PDLC meeting - prep.md",
+  "Notion/RM Tasks/RM Tasks PDLC post-meeting follow-up.md",
+  "Notion/RM Tasks/RM Tasks PMPClassic Release.md",
+  "Notion/RM Tasks/RM Tasks Product Development Lifecycle meeting -.md",
+  "Notion/RM Tasks/RM Tasks RM Install Request -.md",
+  "Notion/RM Tasks/RM Tasks RM Review Slide-Script @Today.md",
+  "Notion/RM Tasks/RM Tasks RM Sub-task.md",
+  "Notion/RM Tasks/RM Tasks RP - Create RM work item and SPR.md",
+  "Notion/RM Tasks/RM Tasks RP - Create release planning document.md",
+  "Notion/RM Tasks/RM Tasks RP - Get initial list of candidate sites.md",
+  "Notion/RM Tasks/RM Tasks RP - Hold meeting and update document-SPR-Notion-Pilot board.md",
+  "Notion/RM Tasks/RM Tasks RP - Request documentation and approval.md",
+  "Notion/RM Tasks/RM Tasks RP - Schedule release planning meeting.md",
+  "Notion/RM Tasks/RM Tasks Regulatory Item Review @Today.md",
+  "Notion/RM Tasks/RM Tasks Release Planning (deprecated).md",
+  "Notion/RM Tasks/RM Tasks Release Planning.md",
+  "Notion/RM Tasks/RM Tasks SPC Upgrades for Local Alpha (deprecated).md",
+  "Notion/RM Tasks/RM Tasks SPC Upgrades for Local Alpha - CMH (deprecated) 1.md",
+  "Notion/RM Tasks/RM Tasks SPC Upgrades for Local Alpha - CMH (deprecated).md",
+  "Notion/RM Tasks/RM Tasks SPC Upgrades for Local Alpha - Generic.md",
+  "Notion/RM Tasks/RM Tasks SPC Upgrades for Local Alpha - Spalitto’s.md",
+  "Notion/RM Tasks/RM Tasks SPC Upgrades for Local Alpha - Swope.md",
+  "Notion/RM Tasks/RM Tasks SPC WS Upgrade to Middleton.md",
+  "Notion/RM Tasks/RM Tasks SPCentral WS Alpha-Beta Release.md",
+  "Notion/RM Tasks/RM Tasks Task.md",
+  "Notion/RM Tasks/RM Tasks Update Pilot Tracking Document-Slide @Today.md",
+  "Notion/RM Tasks/RM Tasks Update Product Dev Priority Review Meeting slide @Today.md",
+  "Notion/RM Tasks/RM Tasks Waiting for CCB meeting.md",
+  "Notion/RM Tasks/RM Tasks Waiting to update BCM.md",
+  "Notion/RM Tasks/RM Tasks iOS-Android Developer Update.md",
+  "Notion/To-Do List/To-Do List New Task.md",
+];
 const SLOT_FORMAT = "YYYY-MM-DDTHH:mm";
 const MAX_CATCH_UP = 60;
 const DAY_ABBR = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
@@ -3396,6 +3475,7 @@ class TemplateLibrary {
     p.addCommand({ id: "manage-templates", name: "Manage templates", callback: () => this.openManager() });
     p.addCommand({ id: "run-repeating-templates", name: "Make any due repeating-template notes now", callback: () => this.runDue(true) });
     p.addRibbonIcon("copy-plus", "New note from template", () => this.openPicker());
+    p.addCommand({ id: "trash-imported-template-copies", name: "Move the Notion importer's template copies to trash", callback: () => this.trashImportedCopies() });
     // repeats: after start-up (and after coming back to the foreground) wait for sync, then catch up
     this.app.workspace.onLayoutReady(() => this.scheduleCheck());
     p.registerDomEvent(document, "visibilitychange", () => { if (document.visibilityState === "visible") this.scheduleCheck(); });
@@ -3425,6 +3505,21 @@ class TemplateLibrary {
     } catch (e) {
       console.error("[notion-style-kanban] couldn't add the templates filter to " + baseFile.path, e);
     }
+  }
+
+  // ----- one-time clean-up -----
+
+  // the Notion importer also saved each template as an ordinary note in its database folder
+  trashImportedCopies() {
+    const files = IMPORTED_TEMPLATE_COPIES.map((p) => this.app.vault.getAbstractFileByPath(p)).filter((f) => f instanceof obsidian.TFile);
+    if (!files.length) { new obsidian.Notice("No imported template copies left."); return; }
+    new ConfirmModal(this.app, "Remove imported template copies",
+      `Move ${files.length} notes the Notion importer made from your templates (like "${files[0].basename}") to Obsidian's trash? Your templates in ${this.root}/ aren't touched, and the notes can be restored from the .trash folder.`,
+      "Move to trash", async () => {
+        let n = 0;
+        for (const f of files) { try { await this.app.vault.trash(f, false); n++; } catch (e) { console.error("[notion-style-kanban] trash", f.path, e); } }
+        new obsidian.Notice(`Moved ${n} imported template cop${n === 1 ? "y" : "ies"} to the trash.`);
+      }).open();
   }
 
   // ----- template banner -----
