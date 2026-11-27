@@ -3058,12 +3058,17 @@ class CommentsPanel {
       if (!panel || (meta && panel.previousSibling !== meta)) {
         if (panel) panel.remove();
         panel = createDiv({ cls: "nk-comments" });
+        // keep the editor from taking over clicks and drags, so comment text can be selected and copied
+        for (const evt of ["mousedown", "pointerdown", "selectstart", "dragstart"]) {
+          panel.addEventListener(evt, (e) => e.stopPropagation());
+        }
         header.insertBefore(panel, before || null);
         panel.dataset.key = "";
       }
       if (panel.dataset.key === key) return;
+      if (panel.querySelector(".nk-comment.is-editing")) return;
       // keep an unsent draft if the panel re-renders
-      const draftEl = panel.querySelector(".nk-comment-input");
+      const draftEl = panel.querySelector(".nk-comment-add .nk-comment-input");
       const draft = draftEl && panel.dataset.path === file.path ? draftEl.value : "";
       panel.dataset.key = key;
       panel.dataset.path = file.path;
@@ -3088,14 +3093,50 @@ class CommentsPanel {
       const head = main.createDiv({ cls: "nk-comment-head" });
       head.createSpan({ cls: "nk-comment-author", text: c.author });
       head.createSpan({ cls: "nk-comment-time", text: c.time });
-      const del = head.createSpan({ cls: "nk-comment-delete", attr: { "aria-label": "Delete comment" } });
+      const tools = head.createSpan({ cls: "nk-comment-tools" });
+      const edit = tools.createSpan({ cls: "nk-comment-tool nk-comment-edit-btn", attr: { "aria-label": "Edit comment" } });
+      setIconSafe(edit, ["pencil", "edit", "edit-3"]);
+      const del = tools.createSpan({ cls: "nk-comment-tool nk-comment-delete", attr: { "aria-label": "Delete comment" } });
       setIconSafe(del, ["trash-2", "trash"]);
       del.onclick = (ev) => {
         ev.preventDefault();
         new ConfirmModal(this.app, "Delete comment", "Delete this comment from the note?", "Delete", () => this.deleteComment(file, thread, idx)).open();
       };
       const body = main.createDiv({ cls: "nk-comment-body markdown-rendered" });
-      obsidian.MarkdownRenderer.render(this.app, c.text, body, file.path, comp);
+      const showBody = () => {
+        body.empty();
+        obsidian.MarkdownRenderer.render(this.app, c.text, body, file.path, comp).then(() => this.linkNotionMentions(body, file));
+      };
+      showBody();
+      edit.onclick = (ev) => {
+        ev.preventDefault();
+        if (row.hasClass("is-editing")) return;
+        row.addClass("is-editing");
+        body.empty();
+        const box = body.createEl("textarea", { cls: "nk-comment-input nk-comment-edit" });
+        box.value = c.text;
+        const bar = body.createDiv({ cls: "nk-comment-edit-bar" });
+        const cancel = bar.createEl("button", { text: "Cancel" });
+        const save = bar.createEl("button", { cls: "mod-cta", text: "Save" });
+        const grow = () => { box.style.height = "auto"; box.style.height = box.scrollHeight + "px"; };
+        const close = () => { row.removeClass("is-editing"); showBody(); };
+        const commit = async () => {
+          const value = box.value.trim();
+          if (!value) return;
+          if (value === c.text) return close();
+          row.removeClass("is-editing");
+          await this.editComment(file, thread, idx, c, value);
+        };
+        box.addEventListener("input", grow);
+        box.addEventListener("keydown", (e) => {
+          e.stopPropagation();
+          if (e.key === "Escape") { e.preventDefault(); close(); }
+          else if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); commit(); }
+        });
+        cancel.onclick = (e) => { e.preventDefault(); close(); };
+        save.onclick = (e) => { e.preventDefault(); commit(); };
+        window.setTimeout(() => { grow(); box.focus(); box.setSelectionRange(box.value.length, box.value.length); }, 0);
+      };
     };
     for (const t of pageThreads) t.comments.forEach((c, i) => renderComment(list, c, t, i));
     for (const t of inline) {
@@ -3152,6 +3193,65 @@ class CommentsPanel {
         lines.splice(at, 0, ...block);
       }
       return lines.join("\n");
+    });
+  }
+
+  async editComment(file, thread, idx, before, value) {
+    await this.app.vault.process(file, (text) => {
+      const p = parseComments(text);
+      const t = p.threads.find((x) => x.lineStart === thread.lineStart && x.title === thread.title) || p.threads.find((x) => x.title === thread.title);
+      let c = t && t.comments[idx];
+      if (!c || c.author !== before.author || c.time !== before.time) {
+        c = t && t.comments.find((x) => x.author === before.author && x.time === before.time && x.text === before.text);
+      }
+      if (!c) {
+        new obsidian.Notice("That comment changed in the note, so it wasn't saved. Try again.");
+        return text;
+      }
+      p.lines.splice(c.lineStart + 1, c.lineEnd - c.lineStart - 1, ...quoteLines(value));
+      return p.lines.join("\n");
+    });
+  }
+
+  // notion page id (no dashes, lower case) -> vault note
+  notionIndex() {
+    if (this._notionIndex) return this._notionIndex;
+    const map = new Map();
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      const fm = (this.app.metadataCache.getFileCache(f) || {}).frontmatter;
+      const id = fm && fm["notion-id"];
+      if (id) map.set(String(id).replace(/-/g, "").toLowerCase(), f);
+    }
+    this._notionIndex = map;
+    if (!this._notionIndexHooked) {
+      this._notionIndexHooked = true;
+      const reset = () => { this._notionIndex = null; };
+      this.plugin.registerEvent(this.app.metadataCache.on("changed", reset));
+      this.plugin.registerEvent(this.app.vault.on("rename", reset));
+      this.plugin.registerEvent(this.app.vault.on("delete", reset));
+    }
+    return map;
+  }
+
+  // Imported mentions of Notion pages are links to notion.so. When that page is
+  // a note in this vault, open the note instead.
+  linkNotionMentions(el, file) {
+    el.querySelectorAll("a[href]").forEach((a) => {
+      const href = a.getAttribute("href") || "";
+      const m = /notion\.(?:so|com)\/(?:[^?#]*?)([0-9a-f]{32})(?:[?#]|$)/i.exec(href.replace(/-/g, ""));
+      if (!m) return;
+      const target = this.notionIndex().get(m[1].toLowerCase());
+      if (!target) return;
+      a.removeClass("external-link");
+      a.addClass("internal-link");
+      a.setAttr("data-href", target.path);
+      a.setAttr("href", target.path);
+      a.removeAttribute("target");
+      a.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        this.app.workspace.openLinkText(target.path, file.path, obsidian.Keymap.isModEvent(ev));
+      }, true);
     });
   }
 
