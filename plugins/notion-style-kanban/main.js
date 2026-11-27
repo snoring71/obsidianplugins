@@ -147,6 +147,8 @@ const NOTION_ICON_MAP = {
   "light-bulb": ["lightbulb"], mail: ["mail"], envelope: ["mail"], person: ["user"], people: ["users"],
   heart: ["heart"], home: ["house", "home"], lock: ["lock"], "hourglass": ["hourglass"], pause: ["pause"],
   stop: ["octagon"], play: ["play"], "arrow-right": ["arrow-right"], "question-mark": ["circle-help", "help-circle"],
+  database: ["database"], categories: ["shapes", "layout-grid"], clipping: ["clipboard"], checklist: ["list-checks"],
+  archive: ["archive"], "clipboard": ["clipboard"],
 };
 const NOTION_ICON_COLORS = {
   gray: "gray", lightgray: "gray", brown: "brown", orange: "orange", yellow: "orange",
@@ -4758,6 +4760,546 @@ class CommentSettingTab extends obsidian.PluginSettingTab {
   }
 }
 
+// ---------- Notion-style sidebar navigation ----------
+//
+// A side panel that lists the vault the way Notion's sidebar lists a workspace:
+// Favorites, then the pages and databases under the root folder (default "Notion").
+// The importer's layout decides what each folder is:
+//   folder with <name>.base (or any .base)  -> database: opens the base, expands to its views
+//   folder with <name>.md                   -> page with sub-pages: opens the note, expands to the rest
+//   other folder                            -> plain folder
+//   .md file                                -> page;  .base file -> database
+// A database's own notes are not listed (RM Tasks has ~1,900 of them); open the base for those.
+// Order, expanded rows, favorites and icons live in data.json `sidebar`. Plain DOM, no Node APIs,
+// so it runs on iOS too. See docs/sidebar.md.
+
+const SIDEBAR_VIEW = "nk-sidebar";
+// Notion's Private section, in its order and with its icons (seeded once into data.json)
+const SIDEBAR_SEED = [
+  ["RM Tasks", "🎏"], ["Notes Database", "icons/database_purple"], ["Release Management", "icons/location_green"],
+  ["Reference Library", "icons/categories_pink"], ["To-Do List", "✔️"], ["Scratch Pad", "icons/clipping_orange"],
+  ["Personal", "icons/torii_red"], ["Backup Strategy", "icons/database_blue"], ["Backup Tasks", "icons/checklist_blue"],
+  ["Timesheet", "icons/clock_blue"], ["Archive", "icons/archive_gray"],
+];
+
+class SidebarNav {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.app = plugin.app;
+    this.refreshSoon = obsidian.debounce(() => this.refreshViews(), 250, true);
+    this.saveSoon = obsidian.debounce(() => this.plugin.saveData(this.plugin.settings), 400, true);
+  }
+
+  load() {
+    const p = this.plugin;
+    this.conf(); // make sure data.json has the block (and the Notion seed) before the first render
+    p.registerView(SIDEBAR_VIEW, (leaf) => new SidebarView(leaf, this));
+    p.addRibbonIcon("panel-left", "Notion sidebar", () => this.reveal());
+    p.addCommand({ id: "open-notion-sidebar", name: "Open Notion sidebar", callback: () => this.reveal() });
+    p.registerEvent(this.app.vault.on("create", () => this.refreshSoon()));
+    p.registerEvent(this.app.vault.on("delete", (f) => { this.forget(f.path); this.refreshSoon(); }));
+    p.registerEvent(this.app.vault.on("rename", (f, old) => { this.moveKeys(old, f.path); this.refreshSoon(); }));
+    p.registerEvent(this.app.vault.on("modify", (f) => { if (f.extension === "base") this.refreshSoon(); }));
+    p.registerEvent(this.app.metadataCache.on("changed", () => this.refreshSoon())); // titles and icons
+    p.registerEvent(this.app.workspace.on("active-leaf-change", () => this.eachView((v) => v.markActive())));
+    p.registerEvent(this.app.workspace.on("file-menu", (menu, file) => {
+      if (!this.listable(file)) return;
+      const fav = this.isFavorite(file.path);
+      menu.addItem((i) => i.setTitle(fav ? "Remove from Favorites" : "Add to Favorites").setIcon(fav ? "star-off" : "star")
+        .onClick(() => this.toggleFavorite(file.path)));
+    }));
+    // first run: put the panel in the left sidebar, next to the file explorer
+    this.app.workspace.onLayoutReady(() => {
+      const c = this.conf();
+      if (this.app.workspace.getLeavesOfType(SIDEBAR_VIEW).length || c.placed) return;
+      c.placed = true;
+      this.saveSoon();
+      this.reveal();
+    });
+  }
+
+  unload() {
+    // leaves are left in place: Obsidian restores the panel when the plugin loads again
+  }
+
+  conf() {
+    const s = this.plugin.settings;
+    if (!s.sidebar) s.sidebar = {};
+    const c = s.sidebar;
+    for (const k of ["order", "icons"]) if (!c[k] || typeof c[k] !== "object") c[k] = {};
+    for (const k of ["expanded", "favorites", "closedSections"]) if (!Array.isArray(c[k])) c[k] = [];
+    if (c.root === undefined) c.root = this.app.vault.getAbstractFileByPath("Notion") instanceof obsidian.TFolder ? "Notion" : "";
+    if (!c.seeded) {
+      c.seeded = true;
+      const root = c.root ? c.root + "/" : "";
+      if (!c.order[c.root]) c.order[c.root] = SIDEBAR_SEED.map(([n]) => [root + n, root + n + ".md"]).flat();
+      for (const [n, ic] of SIDEBAR_SEED) for (const k of [root + n, root + n + ".md"]) if (!c.icons[k]) c.icons[k] = ic;
+    }
+    return c;
+  }
+
+  eachView(fn) {
+    for (const leaf of this.app.workspace.getLeavesOfType(SIDEBAR_VIEW)) if (leaf.view instanceof SidebarView) fn(leaf.view);
+  }
+
+  refreshViews() { this.eachView((v) => v.render()); }
+
+  async reveal() {
+    let leaf = this.app.workspace.getLeavesOfType(SIDEBAR_VIEW)[0];
+    if (!leaf) {
+      leaf = this.app.workspace.getLeftLeaf(false);
+      if (!leaf) return;
+      await leaf.setViewState({ type: SIDEBAR_VIEW, active: true });
+    }
+    this.app.workspace.revealLeaf(leaf);
+  }
+
+  // ----- the tree -----
+
+  rootFolder() {
+    const c = this.conf();
+    const f = c.root ? this.app.vault.getAbstractFileByPath(c.root) : this.app.vault.getRoot();
+    return f instanceof obsidian.TFolder ? f : this.app.vault.getRoot();
+  }
+
+  listable(f) {
+    if (f instanceof obsidian.TFile) return f.extension === "md" || f.extension === "base";
+    return f instanceof obsidian.TFolder && !f.isRoot() && !f.name.startsWith(".");
+  }
+
+  // a folder is worth showing when it holds a note or base somewhere below
+  hasContent(folder, depth) {
+    if ((depth || 0) > 8) return true;
+    for (const ch of folder.children) {
+      if (ch instanceof obsidian.TFile ? this.listable(ch) : this.listable(ch) && this.hasContent(ch, (depth || 0) + 1)) return true;
+    }
+    return false;
+  }
+
+  // what a file or folder is in Notion terms: { key, kind: page|db|folder|view, file?, folder?, base?, view? }
+  node(f) {
+    if (f instanceof obsidian.TFolder) {
+      const own = (ext) => this.app.vault.getAbstractFileByPath(obsidian.normalizePath(`${f.path}/${f.name}.${ext}`));
+      let base = own("base");
+      if (!(base instanceof obsidian.TFile)) base = f.children.find((c) => c instanceof obsidian.TFile && c.extension === "base") || null;
+      if (base) return { key: f.path, kind: "db", folder: f, file: base };
+      const note = own("md");
+      if (note instanceof obsidian.TFile) return { key: f.path, kind: "page", folder: f, file: note };
+      return { key: f.path, kind: "folder", folder: f };
+    }
+    if (f.extension === "base") return { key: f.path, kind: "db", file: f };
+    return { key: f.path, kind: "page", file: f };
+  }
+
+  title(n) {
+    if (n.kind === "view") return n.view.name;
+    if (n.kind === "page") return displayTitle(n.file, this.app);
+    if (n.kind === "db") return n.folder ? n.folder.name : n.file.basename;
+    return n.folder.name;
+  }
+
+  async children(n) {
+    if (n.kind === "db") {
+      const views = await this.plugin.viewTabs.getViews(n.file);
+      return views.map((v) => ({ key: `${n.file.path}::${v.name}`, kind: "view", file: n.file, view: v, parent: n }));
+    }
+    if (!n.folder) return [];
+    const kids = [];
+    for (const ch of n.folder.children) {
+      if (!this.listable(ch)) continue;
+      if (n.file && ch.path === n.file.path) continue; // the page's own note
+      if (ch instanceof obsidian.TFolder && !this.hasContent(ch)) continue; // attachments and the like
+      kids.push(this.node(ch));
+    }
+    return this.sorted(n.key, kids);
+  }
+
+  expandable(n) {
+    if (n.kind === "db") return true;
+    if (!n.folder) return false;
+    return n.folder.children.some((ch) => this.listable(ch) && !(n.file && ch.path === n.file.path));
+  }
+
+  // the saved order first, then the rest by title
+  sorted(parentKey, kids) {
+    const order = this.conf().order[parentKey] || [];
+    const pos = (k) => { const i = order.indexOf(k); return i < 0 ? Infinity : i; };
+    return kids.sort((a, b) => {
+      const pa = pos(a.key), pb = pos(b.key);
+      if (pa !== pb) return pa < pb ? -1 : 1;
+      return this.title(a).localeCompare(this.title(b), undefined, { numeric: true, sensitivity: "base" });
+    });
+  }
+
+  async move(parentKey, siblings, key, toIndex) {
+    const keys = siblings.map((s) => s.key).filter((k) => k !== key);
+    keys.splice(Math.max(0, Math.min(toIndex, keys.length)), 0, key);
+    this.conf().order[parentKey] = keys;
+    await this.plugin.saveData(this.plugin.settings);
+    this.refreshViews();
+  }
+
+  // ----- icons -----
+
+  iconValue(n) {
+    const c = this.conf();
+    if (n.kind === "view") return this.plugin.viewTabs.settings()[this.plugin.viewTabs.key(n.file.path, n.view.name)] || "";
+    if (n.kind === "page") {
+      const fm = (this.app.metadataCache.getFileCache(n.file) || {}).frontmatter || {};
+      if (fm.icon) return asString(fm.icon);
+    }
+    return c.icons[n.key] || "";
+  }
+
+  drawIcon(el, n) {
+    el.empty();
+    el.removeClass("nk-emoji");
+    el.style.color = "";
+    const v = this.iconValue(n);
+    if (v && renderIconValue(el, v)) return;
+    const fallback = n.kind === "view" ? VIEW_TYPE_ICONS[n.view.type] || "layout-list"
+      : n.kind === "db" ? "table-2" : n.kind === "folder" ? "folder" : "file-text";
+    setIconSafe(el, [fallback, "file"]);
+  }
+
+  pickIcon(n, anchorEl) {
+    // pages keep their icon in the note (shared with cards and the note header); the rest in data.json
+    if (n.kind === "page") {
+      this.plugin.openIconPicker(n.file, "icon", anchorEl);
+      return;
+    }
+    if (n.kind === "view") {
+      this.plugin.viewTabs.pickIcon(n.file, n.view.name, anchorEl);
+      return;
+    }
+    const c = this.conf();
+    this.plugin.openIconPicker({
+      current: c.icons[n.key] || "",
+      write: async (value) => {
+        if (value) c.icons[n.key] = value; else delete c.icons[n.key];
+        await this.plugin.saveData(this.plugin.settings);
+        this.refreshViews();
+      },
+    }, "icon", anchorEl);
+  }
+
+  // ----- state -----
+
+  isExpanded(key) { return this.conf().expanded.includes(key); }
+
+  setExpanded(key, on) {
+    const c = this.conf();
+    c.expanded = c.expanded.filter((k) => k !== key);
+    if (on) c.expanded.push(key);
+    this.saveSoon();
+  }
+
+  // a page's note (X/X.md) or a database's base (X/X.base) is favorited as its folder, the row the tree shows
+  favKey(path) {
+    const f = this.app.vault.getAbstractFileByPath(path);
+    if (f instanceof obsidian.TFile && f.parent && !f.parent.isRoot()) {
+      const n = this.node(f.parent);
+      if (n.file && n.file.path === f.path) return f.parent.path;
+    }
+    return path;
+  }
+
+  isFavorite(path) { return this.conf().favorites.includes(this.favKey(path)); }
+
+  async toggleFavorite(path) {
+    path = this.favKey(path);
+    const c = this.conf();
+    if (c.favorites.includes(path)) c.favorites = c.favorites.filter((p) => p !== path);
+    else c.favorites.push(path);
+    await this.plugin.saveData(this.plugin.settings);
+    this.refreshViews();
+  }
+
+  // keep order, favorites, icons and open rows when files move or get renamed
+  moveKeys(oldPath, newPath) {
+    const c = this.conf();
+    const fixPath = (k) => (k === oldPath ? newPath : k.startsWith(oldPath + "/") || k.startsWith(oldPath + "::") ? newPath + k.slice(oldPath.length) : k);
+    // open rows are saved as "<section>|<path>"
+    const fix = (k) => { const i = k.indexOf("|"); return i < 0 ? fixPath(k) : k.slice(0, i + 1) + fixPath(k.slice(i + 1)); };
+    let changed = false;
+    const fixList = (list) => list.map((k) => { const n = fix(k); if (n !== k) changed = true; return n; });
+    c.favorites = fixList(c.favorites);
+    c.expanded = fixList(c.expanded);
+    const order = {};
+    for (const [k, list] of Object.entries(c.order)) { const nk = fix(k); if (nk !== k) changed = true; order[nk] = fixList(list); }
+    c.order = order;
+    const icons = {};
+    for (const [k, v] of Object.entries(c.icons)) { const nk = fix(k); if (nk !== k) changed = true; icons[nk] = v; }
+    c.icons = icons;
+    if (c.root && fix(c.root) !== c.root) { c.root = fix(c.root); changed = true; }
+    if (changed) this.saveSoon();
+  }
+
+  forget(path) {
+    const c = this.conf();
+    if (!c.favorites.includes(path)) return;
+    c.favorites = c.favorites.filter((p) => p !== path);
+    this.saveSoon();
+  }
+
+  // ----- opening and making pages -----
+
+  async open(n, newTab) {
+    const ws = this.app.workspace;
+    if (n.kind === "folder") return;
+    const leaf = ws.getLeaf(newTab ? "tab" : false);
+    if (n.kind === "view") {
+      await leaf.setViewState({ type: "bases", active: true, state: { file: n.file.path, viewName: n.view.name } });
+      this.plugin.viewTabs.refreshSoon();
+    } else {
+      await leaf.openFile(n.file, { active: true });
+    }
+    // on phones the sidebar is a drawer: get it out of the way once something opened
+    if (obsidian.Platform.isMobile && ws.leftSplit && ws.leftSplit.collapse) ws.leftSplit.collapse();
+  }
+
+  // "+" on a row: a new page inside it (a new database entry for a database)
+  async addInside(n, anchorEl) {
+    if (n.kind === "db" || n.kind === "view") {
+      const lib = this.plugin.templates;
+      const db = lib && lib.dbForBase(n.file);
+      if (db) lib.showNewMenu(db, anchorEl);
+      return;
+    }
+    let folder = n.folder;
+    if (!folder) {
+      // a page without sub-pages becomes a folder with its note inside, like the importer lays them out
+      const parent = n.file.parent ? n.file.parent.path : "";
+      const dir = obsidian.normalizePath(`${parent ? parent + "/" : ""}${n.file.basename}`);
+      if (this.app.vault.getAbstractFileByPath(dir)) return new obsidian.Notice(`"${dir}" already exists.`);
+      await this.app.vault.createFolder(dir);
+      await this.app.fileManager.renameFile(n.file, `${dir}/${n.file.name}`);
+      folder = this.app.vault.getAbstractFileByPath(dir);
+    }
+    this.setExpanded(folder.path, true);
+    await this.newPage(folder);
+  }
+
+  async newPage(folder) {
+    const dir = folder && !folder.isRoot() ? folder.path : "";
+    const note = await this.app.vault.create(uniqueNotePath(this.app, dir, "Untitled"), "");
+    await this.app.fileManager.processFrontMatter(note, (fm) => { fm[TITLE_KEY] = ""; });
+    this.plugin.focusTitlePath = note.path;
+    await this.app.workspace.getLeaf(false).openFile(note, { active: true, state: { mode: "source" } });
+    return note;
+  }
+}
+
+class SidebarView extends obsidian.ItemView {
+  constructor(leaf, nav) {
+    super(leaf);
+    this.nav = nav;
+    this.plugin = nav.plugin;
+    this.rows = []; // { el, node }
+    this.renderId = 0;
+  }
+
+  getViewType() { return SIDEBAR_VIEW; }
+  getDisplayText() { return "Notion sidebar"; }
+  getIcon() { return "panel-left"; }
+
+  async onOpen() {
+    this.contentEl.addClass("nk-sidebar");
+    await this.render();
+  }
+
+  async onClose() { this.contentEl.empty(); }
+
+  async render() {
+    const id = ++this.renderId;
+    const nav = this.nav;
+    const c = nav.conf();
+    const box = createDiv({ cls: "nk-sb" });
+    this.rows = [];
+
+    const top = box.createDiv({ cls: "nk-sb-top" });
+    this.action(top, "search", "Search", () => this.app.commands.executeCommandById("switcher:open"));
+    this.action(top, "square-pen", "New page", () => nav.newPage(nav.rootFolder()));
+
+    const favs = c.favorites.map((p) => this.app.vault.getAbstractFileByPath(p)).filter((f) => f && nav.listable(f)).map((f) => nav.node(f));
+    if (favs.length) await this.section(box, "favorites", "Favorites", favs, null);
+    const root = nav.rootFolder();
+    const rootNode = { key: c.root || "", kind: "folder", folder: root };
+    await this.section(box, "private", root.isRoot() ? this.app.vault.getName() : "Private", await nav.children(rootNode), rootNode);
+
+    if (id !== this.renderId) return; // a newer render started meanwhile
+    const scroll = this.contentEl.scrollTop;
+    this.contentEl.empty();
+    this.contentEl.appendChild(box);
+    this.contentEl.scrollTop = scroll;
+    this.markActive();
+  }
+
+  action(parent, icon, label, onClick) {
+    const el = parent.createDiv({ cls: "nk-sb-action" });
+    setIconSafe(el.createSpan({ cls: "nk-sb-action-icon" }), [icon, "plus"]);
+    el.createSpan({ text: label });
+    el.onclick = onClick;
+    return el;
+  }
+
+  async section(box, id, label, nodes, parentNode) {
+    const nav = this.nav;
+    const c = nav.conf();
+    const sec = box.createDiv({ cls: "nk-sb-section" });
+    const head = sec.createDiv({ cls: "nk-sb-section-head" });
+    head.createSpan({ cls: "nk-sb-section-label", text: label });
+    const closed = c.closedSections.includes(id);
+    if (parentNode) {
+      const add = head.createSpan({ cls: "nk-sb-section-add", attr: { "aria-label": "New page" } });
+      setIconSafe(add, ["plus"]);
+      add.onclick = (ev) => { ev.stopPropagation(); nav.newPage(parentNode.folder); };
+    }
+    head.onclick = () => {
+      c.closedSections = c.closedSections.filter((s) => s !== id);
+      if (!closed) c.closedSections.push(id);
+      nav.saveSoon();
+      this.render();
+    };
+    if (closed) { sec.addClass("is-closed"); return; }
+    const list = sec.createDiv({ cls: "nk-sb-list" });
+    // favorites are their own list: they keep the order they were added in
+    for (const n of nodes) await this.row(list, n, 0, parentNode ? parentNode.key : null, nodes, id);
+    if (!nodes.length) list.createDiv({ cls: "nk-sb-empty", text: "No pages inside" });
+  }
+
+  async row(list, n, depth, parentKey, siblings, sectionId) {
+    const nav = this.nav;
+    const el = list.createDiv({ cls: `nk-sb-row nk-sb-${n.kind}` });
+    el.style.setProperty("--nk-depth", String(depth));
+    const exKey = `${sectionId}|${n.key}`;
+    const canExpand = nav.expandable(n);
+    const open = canExpand && nav.isExpanded(exKey);
+    const chev = el.createSpan({ cls: "nk-sb-chevron" + (canExpand ? "" : " is-leaf") });
+    if (canExpand) setIconSafe(chev, [open ? "chevron-down" : "chevron-right"]);
+    const icon = el.createSpan({ cls: "nk-sb-icon" });
+    nav.drawIcon(icon, n);
+    el.createSpan({ cls: "nk-sb-name", text: nav.title(n) || "Untitled" });
+    const tools = el.createSpan({ cls: "nk-sb-tools" });
+    const more = tools.createSpan({ cls: "nk-sb-tool", attr: { "aria-label": "More" } });
+    setIconSafe(more, ["ellipsis", "more-horizontal"]);
+    if (n.kind !== "view") {
+      const add = tools.createSpan({ cls: "nk-sb-tool", attr: { "aria-label": n.kind === "db" ? "New entry" : "Add a page inside" } });
+      setIconSafe(add, ["plus"]);
+      add.onclick = (ev) => { ev.stopPropagation(); nav.addInside(n, add); };
+    }
+
+    const toggle = () => { nav.setExpanded(exKey, !open); this.render(); };
+    chev.onclick = (ev) => { ev.stopPropagation(); if (canExpand) toggle(); };
+    el.onclick = (ev) => {
+      if (n.kind === "folder") return canExpand && toggle();
+      nav.open(n, ev.ctrlKey || ev.metaKey || ev.button === 1);
+    };
+    el.onauxclick = (ev) => { if (ev.button === 1 && n.kind !== "folder") nav.open(n, true); };
+    const menu = (ev) => { ev.preventDefault(); ev.stopPropagation(); this.showMenu(n, ev, parentKey, siblings, icon); };
+    el.oncontextmenu = menu;
+    more.onclick = menu;
+
+    // drag a row up or down among its siblings (favorites keep their own order)
+    if (siblings && n.kind !== "view") {
+      el.draggable = true;
+      el.addEventListener("dragstart", (ev) => {
+        this.dragging = { key: n.key, parentKey, sectionId };
+        ev.dataTransfer.effectAllowed = "move";
+        ev.dataTransfer.setData("text/plain", n.key);
+      });
+      el.addEventListener("dragend", () => { this.dragging = null; this.clearDrop(); });
+      el.addEventListener("dragover", (ev) => {
+        const d = this.dragging;
+        if (!d || d.parentKey !== parentKey || d.sectionId !== sectionId || d.key === n.key) return;
+        ev.preventDefault();
+        const r = el.getBoundingClientRect();
+        this.clearDrop();
+        el.addClass(ev.clientY < r.top + r.height / 2 ? "nk-sb-drop-above" : "nk-sb-drop-below");
+      });
+      el.addEventListener("dragleave", () => el.removeClass("nk-sb-drop-above", "nk-sb-drop-below"));
+      el.addEventListener("drop", (ev) => {
+        const d = this.dragging;
+        if (!d || d.parentKey !== parentKey || d.sectionId !== sectionId) return;
+        ev.preventDefault();
+        const below = el.hasClass("nk-sb-drop-below");
+        this.clearDrop();
+        const rest = siblings.filter((s) => s.key !== d.key);
+        const at = rest.findIndex((s) => s.key === n.key) + (below ? 1 : 0);
+        this.reorder(sectionId, parentKey, siblings, d.key, at);
+      });
+    }
+    this.rows.push({ el, node: n, exKey });
+
+    if (open) {
+      const kids = await nav.children(n);
+      if (!kids.length) {
+        const e = list.createDiv({ cls: "nk-sb-empty", text: n.kind === "db" ? "No views" : "No pages inside" });
+        e.style.setProperty("--nk-depth", String(depth + 1));
+      }
+      for (const k of kids) await this.row(list, k, depth + 1, n.key, k.kind === "view" ? null : kids, sectionId);
+    }
+  }
+
+  clearDrop() {
+    this.contentEl.querySelectorAll(".nk-sb-drop-above, .nk-sb-drop-below").forEach((e) => e.removeClass("nk-sb-drop-above", "nk-sb-drop-below"));
+  }
+
+  async reorder(sectionId, parentKey, siblings, key, at) {
+    if (sectionId === "favorites" && parentKey === null) {
+      const c = this.nav.conf();
+      const keys = c.favorites.filter((k) => k !== key);
+      keys.splice(at, 0, key);
+      c.favorites = keys;
+      await this.plugin.saveData(this.plugin.settings);
+      return this.nav.refreshViews();
+    }
+    await this.nav.move(parentKey, siblings, key, at);
+  }
+
+  showMenu(n, ev, parentKey, siblings, iconEl) {
+    const nav = this.nav;
+    const menu = new obsidian.Menu();
+    if (n.kind !== "folder") menu.addItem((i) => i.setTitle("Open in new tab").setIcon("file-plus").onClick(() => nav.open(n, true)));
+    menu.addItem((i) => i.setTitle("Change icon").setIcon("smile-plus").onClick(() => nav.pickIcon(n, iconEl)));
+    if (n.kind !== "view") {
+      menu.addItem((i) => i.setTitle(n.kind === "db" ? "New entry" : "Add a page inside").setIcon("plus").onClick(() => nav.addInside(n, iconEl)));
+    }
+    // phones can't drag rows: move them from the menu instead
+    if (siblings && n.kind !== "view" && siblings.length > 1) {
+      const idx = siblings.findIndex((s) => s.key === n.key);
+      const fav = parentKey === null;
+      const go = (to) => this.reorder(fav ? "favorites" : "", parentKey, siblings, n.key, to);
+      if (idx > 0) menu.addItem((i) => i.setTitle("Move up").setIcon("arrow-up").onClick(() => go(idx - 1)));
+      if (idx < siblings.length - 1) menu.addItem((i) => i.setTitle("Move down").setIcon("arrow-down").onClick(() => go(idx + 1)));
+    }
+    // Obsidian's own file menu (rename, move, delete, …) for the note, base or folder behind the row;
+    // it also carries "Add to Favorites" (see load)
+    const target = n.kind === "view" ? null : n.kind === "page" || n.kind === "db" ? n.file : n.folder;
+    if (target) {
+      menu.addSeparator();
+      this.app.workspace.trigger("file-menu", menu, target, "nk-sidebar", this.leaf);
+    }
+    if (ev instanceof MouseEvent) menu.showAtMouseEvent(ev);
+    else menu.showAtPosition({ x: 40, y: 120 });
+  }
+
+  markActive() {
+    const f = this.app.workspace.getActiveFile();
+    let viewName = null;
+    const leaf = this.app.workspace.getMostRecentLeaf ? this.app.workspace.getMostRecentLeaf() : null;
+    try { if (leaf && leaf.view && leaf.view.getViewType() === "bases") viewName = (leaf.getViewState().state || {}).viewName || null; } catch (e) {}
+    for (const { el, node, exKey } of this.rows) {
+      let on = false;
+      if (f && node.file && node.file.path === f.path) {
+        // an open database lights up its view when the views are showing, else the database itself
+        on = node.kind === "view" ? viewName === node.view.name : !(node.kind === "db" && viewName && this.nav.isExpanded(exKey));
+      }
+      el.toggleClass("is-active", on);
+    }
+  }
+}
+
 class NotionStyleKanbanPlugin extends obsidian.Plugin {
   // ----- display titles -----
 
@@ -4892,6 +5434,7 @@ class NotionStyleKanbanPlugin extends obsidian.Plugin {
     Object.assign(this.settings, fresh);
     if (this.viewTabs) this.viewTabs.refreshAll();
     this.schemaChanged();
+    if (this.sidebarNav) this.sidebarNav.refreshViews();
   }
 
   async onload() {
@@ -4925,6 +5468,10 @@ class NotionStyleKanbanPlugin extends obsidian.Plugin {
     this.templates = new TemplateLibrary(this);
     this.templates.load();
     this.register(() => this.templates.unload());
+
+    this.sidebarNav = new SidebarNav(this);
+    this.sidebarNav.load();
+    this.register(() => this.sidebarNav.unload());
     // the run id on notes made by repeating templates is bookkeeping: hide it like Notion would
     if (!this.settings.propertyVisibility) this.settings.propertyVisibility = {};
     if (!this.settings.propertyVisibility[RUN_KEY]) this.settings.propertyVisibility[RUN_KEY] = "hide";

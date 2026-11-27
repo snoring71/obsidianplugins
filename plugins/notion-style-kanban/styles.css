@@ -795,3 +795,76 @@ body.nk-comments-on .markdown-source-view.is-live-preview .cm-embed-block.cm-cal
 /* "[[" link suggestions in comment boxes */
 .nk-link-suggest { z-index: var(--layer-popover, 40); max-height: 300px; overflow-y: auto; }
 .nk-link-suggest .suggestion-note { font-size: var(--font-ui-smaller); color: var(--text-muted); }
+
+/* ---------- Notion-style sidebar ---------- */
+.nk-sidebar.view-content { padding: 6px 6px 24px; }
+.nk-sb { font-size: 14px; color: var(--text-normal); user-select: none; }
+.nk-sb-top { margin-bottom: 10px; }
+.nk-sb-action,
+.nk-sb-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.nk-sb-action { color: var(--text-muted); font-weight: 500; }
+.nk-sb-action:hover,
+.nk-sb-row:hover { background: var(--background-modifier-hover); }
+.nk-sb-action-icon,
+.nk-sb-icon,
+.nk-sb-chevron,
+.nk-sb-tool {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
+.nk-sb-action-icon { width: 22px; }
+.nk-sb-action-icon svg,
+.nk-sb-icon svg { width: 18px; height: 18px; }
+.nk-sb-section { margin-bottom: 14px; }
+.nk-sb-section-head {
+  display: flex;
+  align-items: center;
+  min-height: 26px;
+  padding: 0 6px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+.nk-sb-section-head:hover { background: var(--background-modifier-hover); color: var(--text-muted); }
+.nk-sb-section-label { flex: 1; }
+.nk-sb-section.is-closed .nk-sb-section-label::after { content: " ›"; }
+.nk-sb-section-add { display: inline-flex; opacity: 0; color: var(--text-muted); }
+.nk-sb-section-add svg { width: 16px; height: 16px; }
+.nk-sb-section-head:hover .nk-sb-section-add { opacity: 1; }
+.nk-sb-row { padding-left: calc(6px + var(--nk-depth, 0) * 14px); }
+.nk-sb-row.is-active { background: var(--background-modifier-active-hover, var(--background-modifier-hover)); font-weight: 500; }
+.nk-sb-chevron { width: 16px; height: 20px; color: var(--text-faint); border-radius: 4px; }
+.nk-sb-chevron svg { width: 14px; height: 14px; }
+.nk-sb-chevron:not(.is-leaf):hover { background: var(--background-modifier-hover); color: var(--text-normal); }
+.nk-sb-icon { width: 22px; height: 22px; color: var(--text-muted); }
+.nk-sb-icon.nk-emoji { font-size: 16px; line-height: 1; }
+.nk-sb-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nk-sb-view .nk-sb-name { color: var(--text-muted); }
+.nk-sb-tools { display: inline-flex; gap: 2px; opacity: 0; }
+.nk-sb-row:hover .nk-sb-tools { opacity: 1; }
+.nk-sb-tool { width: 22px; height: 22px; border-radius: 4px; color: var(--text-muted); }
+.nk-sb-tool svg { width: 15px; height: 15px; }
+.nk-sb-tool:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
+.nk-sb-empty {
+  padding: 3px 6px 3px calc(28px + var(--nk-depth, 0) * 14px);
+  font-size: 13px;
+  color: var(--text-faint);
+}
+.nk-sb-drop-above { box-shadow: inset 0 2px 0 var(--interactive-accent); }
+.nk-sb-drop-below { box-shadow: inset 0 -2px 0 var(--interactive-accent); }
+/* phones and tablets: no hover, so the row tools stay visible and rows get taller */
+.is-mobile .nk-sb-tools { opacity: 1; }
+.is-mobile .nk-sb-row,
+.is-mobile .nk-sb-action { min-height: 36px; }
