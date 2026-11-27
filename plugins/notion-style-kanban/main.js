@@ -81,6 +81,48 @@ function parseLink(raw) {
   return { linkpath: s, alias: null };
 }
 
+// ---------- display titles ----------
+// Obsidian names a note after its file, and two files in one folder can't share a name, so the
+// Notion importer numbered repeated titles ("Create release planning document 1") and replaced
+// characters files can't hold ("/" became "-"). A note can carry its real title in this property;
+// the board, links, tabs and the note header show it, while the file name stays unique.
+const TITLE_KEY = "title";
+let APP = null;
+
+function titleOf(fm) {
+  const t = fm ? fm[TITLE_KEY] : undefined;
+  if (typeof t === "string") return t.trim();
+  if (typeof t === "number") return String(t);
+  return "";
+}
+
+function displayTitle(file, app) {
+  if (!file) return "";
+  const a = app || APP;
+  const c = a ? a.metadataCache.getFileCache(file) : null;
+  return titleOf(c && c.frontmatter) || file.basename;
+}
+
+// text that is safe inside [[target|text]]
+function linkAlias(text) {
+  return String(text).replace(/\|/g, "-").replace(/\[\[|\]\]/g, "").trim();
+}
+
+// "Name", "Name 1", "Name 12" all count as the file for the title "Name"
+function fileFitsTitle(basename, title) {
+  const want = safeFileName(title || "Untitled");
+  if (basename === want) return true;
+  return basename.startsWith(want + " ") && /^\d+$/.test(basename.slice(want.length + 1));
+}
+
+function uniqueNotePath(app, folder, name) {
+  const pathFor = (nm) => obsidian.normalizePath(`${folder && folder !== "/" ? folder + "/" : ""}${nm}.md`);
+  let target = name;
+  let n = 1;
+  while (app.vault.getAbstractFileByPath(pathFor(target))) target = `${name} ${n++}`;
+  return pathFor(target);
+}
+
 function setIconSafe(el, names) {
   for (const n of names) {
     obsidian.setIcon(el, n);
@@ -231,7 +273,7 @@ class NotionKanbanView extends obsidian.BasesView {
   resolve(raw, sourcePath) {
     const { linkpath, alias } = parseLink(raw);
     const file = this.app.metadataCache.getFirstLinkpathDest(linkpath, sourcePath);
-    const name = alias || (file ? file.basename : linkpath.split("/").pop());
+    const name = file ? displayTitle(file, this.app) : alias || linkpath.split("/").pop();
     return { file, name, linkpath };
   }
 
@@ -414,7 +456,7 @@ class NotionKanbanView extends obsidian.BasesView {
         this.plugin.openIconPicker(c.file, s.iconKey, titleIcon);
       };
     }
-    titleRow.createSpan({ cls: "nk-title", text: c.file.basename });
+    titleRow.createSpan({ cls: "nk-title", text: displayTitle(c.file, this.app) });
 
     // tags
     const tags = s.tagKey ? asList(c.fm[s.tagKey]).map(String) : [];
@@ -656,20 +698,19 @@ class NotionKanbanView extends obsidian.BasesView {
     const sample = entries[0] ? entries[0].file : null;
     const folder = sample && sample.parent ? sample.parent.path : "";
     const sampleFm = sample ? this.fm(sample) : {};
-    let name = "Untitled";
-    let n = 1;
-    const pathFor = (nm) => obsidian.normalizePath(`${folder ? folder + "/" : ""}${nm}.md`);
-    while (this.app.vault.getAbstractFileByPath(pathFor(name))) name = `Untitled ${n++}`;
-    const file = await this.app.vault.create(pathFor(name), "");
+    const file = await this.app.vault.create(uniqueNotePath(this.app, folder, "Untitled"), "");
     await this.app.fileManager.processFrontMatter(file, (fm) => {
+      // an empty title puts the Notion-style title header on the note; typing in it names the task
+      fm[TITLE_KEY] = "";
       // keep the note inside this base's filter (the importer links notes to their base)
       if (sampleFm.base) fm.base = sampleFm.base;
       if (column !== NO_VALUE) fm[s.columnKey] = column;
       if (s.laneKey && lane && lane !== NO_VALUE) fm[s.laneKey] = lane;
       if (s.orderKey) fm[s.orderKey] = 0;
     });
+    this.plugin.focusTitlePath = file.path;
     const leaf = this.app.workspace.getLeaf("tab");
-    await leaf.openFile(file, { state: { mode: "source" }, eState: { rename: "all" } });
+    await leaf.openFile(file, { state: { mode: "source" } });
   }
 }
 
@@ -1036,7 +1077,12 @@ class NoteIconHeader {
 
   unload() {
     if (this.observer) this.observer.disconnect();
-    document.querySelectorAll(".nk-note-icon-wrap").forEach((e) => e.remove());
+    document.querySelectorAll(".nk-note-icon-wrap, .nk-title-header").forEach((e) => e.remove());
+    document.querySelectorAll(".nk-hidden-inline-title").forEach((e) => e.removeClass("nk-hidden-inline-title"));
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const t = leaf.tabHeaderInnerTitleEl;
+      if (t && leaf.view && leaf.view.file) t.setText(leaf.view.file.basename);
+    }
   }
 
   refreshAll() {
@@ -1045,6 +1091,10 @@ class NoteIconHeader {
       const view = leaf.view;
       if (!view || !view.file || !view.containerEl) continue;
       this.renderInView(view);
+      // the tab shows the display title too (Obsidian resets it on rename; this runs again after)
+      const tab = leaf.tabHeaderInnerTitleEl;
+      const want = displayTitle(view.file, this.app);
+      if (tab && tab.textContent !== want) tab.setText(want);
       // watch only the header level (not the note text) so typing doesn't trigger work
       if (this.observer) {
         view.containerEl.querySelectorAll(".markdown-preview-sizer, .cm-sizer").forEach((h) => this.observer.observe(h, { childList: true }));
@@ -1067,6 +1117,7 @@ class NoteIconHeader {
         wrap = createDiv({ cls: "nk-note-icon-wrap" });
         anchorParent.insertBefore(wrap, title || anchorParent.firstChild);
       }
+      this.renderTitle(view, host, title, fm);
       if (wrap.dataset.value === value && wrap.dataset.path === file.path && wrap.childElementCount) return;
       wrap.dataset.value = value;
       wrap.dataset.path = file.path;
@@ -1083,6 +1134,104 @@ class NoteIconHeader {
       }
     });
   }
+
+  // Notes with a `title` property get a Notion-style title in place of Obsidian's inline title
+  // (which shows, and renames, the file). Editing it changes the title; the file follows when it can.
+  renderTitle(view, host, native, fm) {
+    let el = host.querySelector(":scope > .nk-title-header, :scope > .mod-header > .nk-title-header");
+    const on = native && Object.prototype.hasOwnProperty.call(fm, TITLE_KEY);
+    if (!on) {
+      if (el) el.remove();
+      if (native) native.removeClass("nk-hidden-inline-title");
+      return;
+    }
+    native.addClass("nk-hidden-inline-title");
+    if (!el || el.previousElementSibling !== native) {
+      if (el) el.remove();
+      el = createDiv({ cls: "nk-title-header", attr: { contenteditable: "plaintext-only", spellcheck: "false", "data-placeholder": "Untitled" } });
+      native.insertAdjacentElement("afterend", el);
+      this.wireTitle(view, el);
+    }
+    if (el.dataset.editing === "1") return;
+    const text = titleOf(fm) || (fm[TITLE_KEY] === "" || fm[TITLE_KEY] === null ? "" : view.file.basename);
+    if (el.textContent !== text) el.textContent = text;
+    if (this.plugin.focusTitlePath === view.file.path && host.closest(".markdown-source-view") && host.isShown()) {
+      this.plugin.focusTitlePath = null;
+      window.setTimeout(() => {
+        el.focus();
+        const sel = window.getSelection();
+        if (sel) { const r = document.createRange(); r.selectNodeContents(el); sel.removeAllRanges(); sel.addRange(r); }
+      }, 0);
+    }
+  }
+
+  wireTitle(view, el) {
+    let original = "";
+    el.addEventListener("focus", () => { el.dataset.editing = "1"; original = el.textContent; });
+    el.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" || ev.key === "Escape") {
+        ev.preventDefault();
+        if (ev.key === "Escape") el.textContent = original;
+        el.blur();
+        if (view.editor && view.getMode && view.getMode() === "source") view.editor.focus();
+      }
+    });
+    el.addEventListener("paste", (ev) => {
+      // keep it one line of plain text
+      ev.preventDefault();
+      const text = ((ev.clipboardData && ev.clipboardData.getData("text/plain")) || "").replace(/\s+/g, " ");
+      document.execCommand("insertText", false, text);
+    });
+    el.addEventListener("blur", async () => {
+      delete el.dataset.editing;
+      const text = el.textContent.replace(/\s+/g, " ").trim();
+      if (text !== original.replace(/\s+/g, " ").trim() && view.file) await this.plugin.setDisplayTitle(view.file, text);
+      this.refreshSoon();
+    });
+  }
+}
+
+// ---------- Notion titles for imported notes ----------
+
+// Previews, then applies, the real Notion page titles to imported notes whose file names differ
+// (numbered duplicates, "/" turned into "-", dropped date mentions). The titles come from
+// notion-titles.json in the plugin folder: { "<notion page id>": "<title>" }.
+class NotionTitlesModal extends obsidian.Modal {
+  constructor(plugin, plan) {
+    super(plugin.app);
+    this.plugin = plugin;
+    this.plan = plan;
+    this.fixLinks = true;
+  }
+  onOpen() {
+    const { contentEl, plan } = this;
+    this.modalEl.addClass("nk-titles-modal");
+    this.titleEl.setText("Use Notion page titles");
+    contentEl.createEl("p", {
+      text: `${plan.notes.length} imported notes have a file name that differs from their Notion title. ` +
+        "Each gets a title property with the Notion title, which the board, links, tabs and note header show. File names don't change.",
+    });
+    const list = contentEl.createDiv({ cls: "nk-titles-list" });
+    for (const n of plan.notes) {
+      const row = list.createDiv({ cls: "nk-titles-row" });
+      row.createSpan({ cls: "nk-titles-old", text: n.file.path.replace(/\.md$/, "") });
+      row.createSpan({ cls: "nk-titles-arrow", text: "→" });
+      row.createSpan({ cls: "nk-titles-new", text: n.title });
+    }
+    new obsidian.Setting(contentEl)
+      .setName("Also update link labels")
+      .setDesc(`Relabel ${plan.links} links in ${plan.sources} notes (e.g. Sub-task and Parent task) that show the old file name.`)
+      .addToggle((t) => t.setValue(true).onChange((v) => { this.fixLinks = v; }));
+    const row = contentEl.createDiv({ cls: "modal-button-container" });
+    const ok = row.createEl("button", { cls: "mod-cta", text: `Apply to ${plan.notes.length} notes` });
+    ok.onclick = async () => {
+      ok.disabled = true;
+      this.close();
+      await this.plugin.applyNotionTitles(plan, this.fixLinks);
+    };
+    row.createEl("button", { text: "Cancel" }).onclick = () => this.close();
+  }
+  onClose() { this.contentEl.empty(); }
 }
 
 // ---------- Notion-style property options (select / multi-select) ----------
@@ -1154,7 +1303,8 @@ class PropertySchemas {
   visibilityOf(prop) {
     if (!prop) return "always";
     const k = Object.keys(this.visibility).find((n) => sameText(n, prop));
-    return (k && this.visibility[k]) || "always";
+    // the title shows in the note header, so its property row is hidden unless chosen otherwise
+    return (k && this.visibility[k]) || (sameText(prop, TITLE_KEY) ? "hide" : "always");
   }
 
   async setVisibility(prop, mode) {
@@ -1902,7 +2052,1678 @@ class ViewTabsBar {
   }
 }
 
+// ---------- Notion-style buttons in notes ----------
+//
+// A ```notion-button``` code block draws a button. Its body is YAML:
+//   label: Add subtask
+//   icon: plus
+//   confirm: Are you sure?            (optional)
+//   steps:                            (or a single top-level `action:`)
+//     - action: add-subtask
+//       name: Subtask
+// "Insert button" (command, or right-click in the editor) picks a ready-made
+// button or builds a new one step by step; the gear on a button edits it.
+// See docs/notion-buttons.md.
+
+const BUTTON_DEFAULTS = {
+  parentProperty: "Parent task",
+  subtaskProperty: "Sub-task",
+  completedProperty: "Completed Tasks",
+  statusProperty: "Status",
+};
+const BUTTON_KEYS = Object.keys(BUTTON_DEFAULTS);
+const DEFAULT_SUBTASK_TEMPLATE = "Templates/RM Tasks/RM Sub-task.md";
+const TEMPLATE_SKIP_KEYS = new Set(["base", "notion-id", "position", "manual_order", "Last edited time"]);
+
+const STEP_TYPES = [
+  { id: "add-subtask", name: "Add sub-task", icon: "list-plus", desc: "Create a note with Parent task = this page" },
+  { id: "add-task", name: "Add task", icon: "file-plus", desc: "Create a note from a template, not linked to this page" },
+  { id: "complete-subtask", name: "Move to Completed Tasks", icon: "check-square", desc: "On a sub-task: move it to the parent's Completed Tasks and set its status" },
+  { id: "unparent-all", name: "Un-parent all sub-tasks", icon: "unlink", desc: "Clear this page's Sub-task list and each child's Parent task" },
+  { id: "adopt-matching", name: "Make matching tasks sub-tasks", icon: "filter", desc: "Find tasks that match filters and set their Parent task to this page" },
+  { id: "edit-properties", name: "Edit this page's properties", icon: "pencil", desc: "Set, add to or remove from this page's properties" },
+  { id: "rename", name: "Rename this page", icon: "text-cursor-input", desc: "Give this page a new name, with optional dates" },
+  { id: "insert", name: "Insert text", icon: "text", desc: "Insert lines above or below the button" },
+];
+const STEP_TYPE = Object.fromEntries(STEP_TYPES.map((t) => [t.id, t]));
+
+const FILTER_OPS = [
+  ["contains", "contains"],
+  ["not-contains", "does not contain"],
+  ["is", "is"],
+  ["is-not", "is not"],
+  ["is-any", "is any of (comma separated)"],
+  ["starts-with", "starts with"],
+  ["not-starts-with", "does not start with"],
+  ["is-empty", "is empty"],
+  ["not-empty", "is not empty"],
+];
+
+const RP = "Templates/RM Tasks/RP - ";
+const tagButtons = (tag, icon) => [
+  { label: `Add "${tag}" tag`, icon: icon || "tag", steps: [{ action: "edit-properties", changes: [{ property: "Tag", mode: "add", value: tag }] }] },
+  { label: `Remove "${tag}" tag`, icon: "x", steps: [{ action: "edit-properties", changes: [{ property: "Tag", mode: "remove", value: tag }] }] },
+];
+const holderButton = (tag) => ({
+  label: `Create new "${tag}" holder task`,
+  icon: "clock",
+  confirm: "Are you sure you want to create a new task? Please confirm that an open task does not already exist.",
+  steps: [{ action: "add-task", template: `Templates/RM Tasks/${tag}.md`, open: "tab" }],
+});
+const adoptButton = (tag) => ({
+  label: `Add tasks with "${tag}" tag as sub-tasks`,
+  icon: "filter",
+  steps: [{
+    action: "adopt-matching",
+    where: [
+      { property: "Tag", op: "contains", value: tag },
+      { property: "Status", op: "is-any", value: "Not started, Up next, In progress" },
+      { property: "Parent task", op: "is-empty" },
+      // Notion: Name is not "<tag>". Obsidian numbers repeat names ("… 1"), so match the start.
+      { property: "file.name", op: "not-starts-with", value: tag },
+    ],
+  }],
+});
+const SET_DONE = { label: "Set this item's status to Done", icon: "check", steps: [{ action: "edit-properties", changes: [{ property: "Status", mode: "set", value: "Done" }] }] };
+const nestedBlock = (btn) => buttonBlock(normalizeButton(btn)).replace(/\n$/, "").split("\n").map((l) => "\t" + l).join("\n");
+
+// The buttons on the RM Tasks templates in Notion (read 2026-11-27)
+const BUILTIN_BUTTONS = [
+  { label: "Add subtask", icon: "plus", steps: [{ action: "add-subtask", name: "Subtask", template: DEFAULT_SUBTASK_TEMPLATE }] },
+  {
+    label: "Move to Completed Tasks and set to Closed",
+    icon: "check-square",
+    steps: [{ action: "complete-subtask", status: "Closed" }],
+  },
+  SET_DONE,
+  {
+    label: "Create release planning subtasks",
+    icon: "calendar-plus",
+    confirm: "Are you sure you want to create sub-tasks?",
+    steps: [
+      { action: "add-subtask", name: "Create RM work item and SPR", template: RP + "Create RM work item and SPR.md", open: "none" },
+      { action: "add-subtask", name: "Request documentation and approval", template: RP + "Request documentation and approval.md", open: "none" },
+      { action: "add-subtask", name: "Get initial list of candidate sites", template: RP + "Get initial list of candidate sites.md", open: "none" },
+      { action: "add-subtask", name: "Create release planning document", template: RP + "Create release planning document.md", open: "none" },
+      { action: "add-subtask", name: "Schedule release planning meeting", template: RP + "Schedule release planning meeting.md", open: "none" },
+      { action: "add-subtask", name: "Hold meeting and update document-SPR", template: RP + "Hold meeting and update document-SPR-Notion-Pilot board.md", open: "none" },
+    ],
+  },
+  {
+    label: "Create product development lifecycle meeting sub-tasks",
+    icon: "calendar-plus",
+    confirm: "Are you sure you want to create sub-tasks?",
+    confirmText: "Yes",
+    steps: [
+      { action: "add-subtask", name: "Meeting preparation tasks", template: "Templates/RM Tasks/PDLC meeting - prep.md", open: "none" },
+      { action: "add-subtask", name: "Meeting follow-up tasks", template: "Templates/RM Tasks/PDLC post-meeting follow-up.md", open: "none" },
+    ],
+  },
+  holderButton("Waiting for CCB meeting"),
+  holderButton("Waiting to update BCM"),
+  adoptButton("Waiting for CCB meeting"),
+  adoptButton("Waiting to update BCM"),
+  { label: "Un-parent all sub-tasks", icon: "unlink", steps: [{ action: "unparent-all" }] },
+  null, // "Add standard tasks", filled in below (it contains buttons)
+  ...tagButtons("Waiting for CCB meeting"),
+  ...tagButtons("Waiting for feedback"),
+  ...tagButtons("Waiting on dev work"),
+  ...tagButtons("Waiting on testing"),
+  {
+    label: "Add \"Waiting on testing\" tag and move to backlog",
+    icon: "archive",
+    steps: [{ action: "edit-properties", changes: [{ property: "Tag", mode: "add", value: "Waiting on testing" }, { property: "Team", mode: "set", value: "General Backlog" }] }],
+  },
+  {
+    label: "Remove \"Waiting on testing\" tag and move out of backlog",
+    icon: "archive-restore",
+    steps: [{ action: "edit-properties", changes: [{ property: "Tag", mode: "remove", value: "Waiting on testing" }, { property: "Team", mode: "set", value: "Release Management" }] }],
+  },
+  {
+    label: "Two week reminder and move to General Backlog",
+    icon: "alarm-clock",
+    steps: [{ action: "edit-properties", changes: [{ property: "Reminder Date", mode: "set", value: "{{today+14:YYYY-MM-DD}}T09:00" }, { property: "Team", mode: "set", value: "General Backlog" }] }],
+  },
+];
+
+const WEEKDAYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+
+function safeFileName(name) {
+  return String(name || "Untitled").replace(/[\\/:*?"<>|#^[\]]/g, "-").replace(/\s+/g, " ").trim() || "Untitled";
+}
+
+// {{today}}, {{today:YYYY-MM-DD}}, {{next:tuesday:MM-DD-YYYY}}, {{next:tue+1}} (one week later), {{title}}
+function expandVars(text, file) {
+  const m = obsidian.moment;
+  return String(text === undefined || text === null ? "" : text).replace(/\{\{\s*([^}]+?)\s*\}\}/g, (all, expr) => {
+    const parts = expr.split(":");
+    const kind = parts[0].trim().toLowerCase();
+    if (kind === "title") return file ? displayTitle(file) : "";
+    const rel = kind.match(/^(today|date)([+-]\d+)?$/);
+    if (rel) return m().add(Number(rel[2] || 0), "days").format(parts.slice(1).join(":") || "YYYY-MM-DD");
+    if (kind === "next") {
+      const spec = (parts[1] || "").trim().toLowerCase();
+      const mm = spec.match(/^([a-z]+)(?:\+(\d+))?$/);
+      const day = mm ? WEEKDAYS.findIndex((d) => d.startsWith(mm[1].slice(0, 3))) : -1;
+      if (day < 0) return all;
+      const now = m().startOf("day");
+      let add = day - now.day();
+      if (add < 0) add += 7; // the same weekday counts as "next" (Notion's formula)
+      add += 7 * Number(mm[2] || 0);
+      return now.add(add, "days").format(parts.slice(2).join(":") || "YYYY-MM-DD");
+    }
+    return all;
+  });
+}
+
+function normalizeButton(raw) {
+  const cfg = Object.assign({}, raw || {});
+  let steps = Array.isArray(cfg.steps) ? cfg.steps.filter((s) => s && typeof s === "object") : null;
+  if (!steps) {
+    // older single-action form: action + options at the top level
+    const step = { action: cfg.action || "add-subtask" };
+    for (const k of ["name", "template", "tasks", "properties", "open", "folder", "status", "text", "position", "where", "changes"]) {
+      if (cfg[k] !== undefined) step[k] = cfg[k];
+    }
+    if (step.action === "add-subtask" && step.template === undefined && !step.tasks) step.template = DEFAULT_SUBTASK_TEMPLATE;
+    steps = [step];
+  }
+  cfg.steps = steps.map((s) => Object.assign({}, s, { action: String(s.action || "add-subtask").toLowerCase() }));
+  for (const k of BUTTON_KEYS) if (cfg[k] === undefined) cfg[k] = BUTTON_DEFAULTS[k];
+  return cfg;
+}
+
+// The YAML we write back for a button: only what the user set
+function buttonToYaml(btn) {
+  const out = {};
+  out.label = btn.label || "Button";
+  if (btn.icon) out.icon = btn.icon;
+  if (btn.description) out.description = btn.description;
+  if (btn.confirm) out.confirm = btn.confirm;
+  if (btn.confirm && btn.confirmText && btn.confirmText !== "Continue") out.confirmText = btn.confirmText;
+  for (const k of BUTTON_KEYS) if (btn[k] && btn[k] !== BUTTON_DEFAULTS[k]) out[k] = btn[k];
+  out.steps = (btn.steps || []).map((s) => {
+    const o = { action: s.action };
+    for (const [k, v] of Object.entries(s)) {
+      if (k === "action" || v === undefined || v === null || v === "") continue;
+      if (Array.isArray(v) && !v.length) continue;
+      if (typeof v === "object" && !Array.isArray(v) && !Object.keys(v).length) continue;
+      o[k] = v;
+    }
+    return o;
+  });
+  return obsidian.stringifyYaml(out).replace(/\s+$/, "");
+}
+
+function buttonBlock(btn) {
+  return "```notion-button\n" + buttonToYaml(btn) + "\n```\n";
+}
+
+function standardTasksButton() {
+  const ccb = tagButtons("Waiting for CCB meeting");
+  return {
+    label: "Add standard tasks",
+    icon: "list-checks",
+    steps: [{
+      action: "insert",
+      position: "top",
+      text: [
+        "- [ ] Test in .local",
+        "- [ ] Enter CCB",
+        nestedBlock(ccb[0]),
+        "- [ ] Confirm that CCB is approved",
+        nestedBlock(ccb[1]),
+        "- [ ] Deploy to 1x/2x",
+        "- [ ] Update BCM",
+        "- [ ] Close item on RM board",
+        nestedBlock(Object.assign({}, SET_DONE, { label: "Set Status to Done" })),
+      ].join("\n"),
+    }],
+  };
+}
+
+class NoteButtons {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.app = plugin.app;
+  }
+
+  load() {
+    const p = this.plugin;
+    p.registerMarkdownCodeBlockProcessor("notion-button", (src, el, ctx) => this.render(src, el, ctx));
+    p.addCommand({
+      id: "insert-button",
+      name: "Insert button",
+      editorCallback: (editor) => this.openPicker(editor),
+    });
+    p.registerEvent(
+      this.app.workspace.on("editor-menu", (menu, editor) => {
+        menu.addItem((item) => item.setTitle("Insert button").setIcon("mouse-pointer-click").onClick(() => this.openPicker(editor)));
+      })
+    );
+    p.addCommand({
+      id: "add-subtask",
+      name: "Add sub-task to current note",
+      checkCallback: (checking) => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file || file.extension !== "md") return false;
+        if (!checking) this.guard(() => this.runButton(normalizeButton(BUILTIN_BUTTONS[0]), file));
+        return true;
+      },
+    });
+    p.addCommand({
+      id: "complete-subtask",
+      name: "Move current sub-task to Completed Tasks and set to Closed",
+      checkCallback: (checking) => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file || file.extension !== "md") return false;
+        if (!checking) this.guard(() => this.runButton(normalizeButton(BUILTIN_BUTTONS[1]), file));
+        return true;
+      },
+    });
+  }
+
+  // ----- library -----
+
+  library() {
+    const i = BUILTIN_BUTTONS.indexOf(null);
+    if (i >= 0) BUILTIN_BUTTONS[i] = standardTasksButton();
+    const mine = asList(this.plugin.settings.buttonLibrary).filter((b) => b && typeof b === "object" && b.label);
+    return { builtin: BUILTIN_BUTTONS, mine };
+  }
+
+  async saveToLibrary(btn) {
+    const fresh = (await this.plugin.loadData()) || {};
+    const list = asList(fresh.buttonLibrary).filter((b) => b && b.label !== btn.label);
+    list.push(JSON.parse(JSON.stringify(Object.assign({}, btn))));
+    this.plugin.settings.buttonLibrary = list;
+    await this.plugin.saveData(Object.assign(fresh, { buttonLibrary: list }));
+    new obsidian.Notice(`Saved "${btn.label}" to My buttons`);
+  }
+
+  async removeFromLibrary(label) {
+    const fresh = (await this.plugin.loadData()) || {};
+    const list = asList(fresh.buttonLibrary).filter((b) => b && b.label !== label);
+    this.plugin.settings.buttonLibrary = list;
+    await this.plugin.saveData(Object.assign(fresh, { buttonLibrary: list }));
+  }
+
+  openPicker(editor) {
+    new ButtonPickerModal(this, (btn) => {
+      if (!btn) {
+        new ButtonBuilderModal(this, null, (made) => this.insertBlock(editor, made)).open();
+        return;
+      }
+      this.insertBlock(editor, btn);
+    }).open();
+  }
+
+  insertBlock(editor, btn) {
+    const cur = editor.getCursor();
+    const line = editor.getLine(cur.line);
+    const before = line.trim() ? "\n" : "";
+    editor.replaceRange(before + buttonBlock(normalizeButton(btn)), { line: cur.line, ch: line.length });
+  }
+
+  // ----- rendering -----
+
+  parse(src) {
+    let raw;
+    try { raw = obsidian.parseYaml(src); } catch (e) { return { error: e.message }; }
+    if (raw === null || raw === undefined) raw = {};
+    if (typeof raw !== "object" || Array.isArray(raw)) return { error: "the block should hold lines like  label: Add subtask" };
+    return normalizeButton(raw);
+  }
+
+  render(src, el, ctx) {
+    const cfg = this.parse(src);
+    const wrap = el.createDiv({ cls: "nk-note-button-wrap" });
+    if (cfg.error) {
+      wrap.createDiv({ cls: "nk-note-button-error", text: "Button settings can't be read: " + cfg.error });
+      return;
+    }
+    const btn = wrap.createEl("button", { cls: "nk-note-button" });
+    if (cfg.icon) renderIconValue(btn.createSpan({ cls: "nk-note-button-icon" }), String(cfg.icon));
+    btn.createSpan({ cls: "nk-note-button-label", text: String(cfg.label || "Button") });
+    if (cfg.description) btn.setAttr("aria-label", String(cfg.description));
+    btn.addEventListener("mousedown", (ev) => ev.stopPropagation());
+    btn.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const file = this.app.vault.getAbstractFileByPath(ctx.sourcePath);
+      if (!(file instanceof obsidian.TFile)) return;
+      const run = () => {
+        btn.disabled = true;
+        this.guard(() => this.runButton(cfg, file, el, ctx)).finally(() => { btn.disabled = false; });
+      };
+      if (cfg.confirm) new ConfirmModal(this.app, String(cfg.label || "Confirm"), String(cfg.confirm), String(cfg.confirmText || "Continue"), run).open();
+      else run();
+    });
+    const gear = wrap.createDiv({ cls: "nk-note-button-gear clickable-icon", attr: { "aria-label": "Edit button" } });
+    obsidian.setIcon(gear, "settings");
+    gear.addEventListener("mousedown", (ev) => ev.stopPropagation());
+    gear.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      new ButtonBuilderModal(this, cfg, (made) => this.guard(() => this.replaceBlock(ctx, el, src, made))).open();
+    });
+  }
+
+  async replaceBlock(ctx, el, src, btn) {
+    const file = this.app.vault.getAbstractFileByPath(ctx.sourcePath);
+    if (!(file instanceof obsidian.TFile)) return;
+    const info = ctx.getSectionInfo(el);
+    const block = buttonBlock(normalizeButton(btn)).replace(/\n$/, "");
+    await this.app.vault.process(file, (data) => {
+      const nl = data.includes("\r\n") ? "\r\n" : "\n";
+      const lines = data.split(/\r?\n/);
+      if (info && /^\s*(```|~~~)\s*notion-button/.test(lines[info.lineStart] || "")) {
+        lines.splice(info.lineStart, info.lineEnd - info.lineStart + 1, ...block.split("\n"));
+        return lines.join(nl);
+      }
+      const body = src.replace(/\s+$/, "");
+      const re = new RegExp("```notion-button\\r?\\n" + body.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\n/g, "\\r?\\n") + "\\s*\\r?\\n```");
+      if (re.test(data)) return data.replace(re, block.split("\n").join(nl));
+      new obsidian.Notice("Couldn't find this button in the note to update it.");
+      return data;
+    });
+  }
+
+  async guard(fn) {
+    try { await fn(); } catch (e) {
+      console.error("[notion-style-kanban] button failed", e);
+      new obsidian.Notice("Button failed: " + (e && e.message ? e.message : e));
+    }
+  }
+
+  // ----- running -----
+
+  async runButton(cfg, file, el, ctx) {
+    const state = { file, created: [] };
+    for (const step of cfg.steps) {
+      await this.runStep(cfg, step, state, el, ctx);
+    }
+    const toOpen = state.created.filter((c) => c.open !== "none");
+    if (toOpen.length) {
+      const c = toOpen[0];
+      const leaf = c.open === "split" ? this.app.workspace.getLeaf("split") : this.app.workspace.getLeaf("tab");
+      await leaf.openFile(c.file, { state: { mode: "source" }, eState: { rename: "all" } });
+    } else if (state.created.length) {
+      const n = state.created.length;
+      new obsidian.Notice(n === 1 ? `Added "${displayTitle(state.created[0].file)}"` : `Added ${n} tasks`);
+    }
+  }
+
+  async runStep(cfg, step, state, el, ctx) {
+    const file = state.file;
+    switch (step.action) {
+      case "add-subtask":
+      case "add-subtasks": {
+        let specs = asList(step.tasks).map((t) => (typeof t === "string" ? { name: t } : t || {}));
+        if (!specs.length) specs = [step];
+        for (const spec of specs) {
+          const child = await this.createNote(cfg, Object.assign({}, step, spec), file, true);
+          state.created.push({ file: child, open: this.openMode(step, specs.length) });
+        }
+        return;
+      }
+      case "add-task": {
+        const note = await this.createNote(cfg, step, file, false);
+        state.created.push({ file: note, open: this.openMode(step, 1) });
+        return;
+      }
+      case "complete-subtask": return this.completeSubtask(cfg, step, file);
+      case "unparent-all": return this.unparentAll(cfg, file);
+      case "adopt-matching": return this.adoptMatching(cfg, step, file);
+      case "edit-properties": return this.editProperties(step, file);
+      case "rename": return this.renameNote(step, file);
+      case "insert": return this.insertText(step, file, el, ctx);
+      default: new obsidian.Notice(`Unknown button step "${step.action}"`);
+    }
+  }
+
+  openMode(step, count) {
+    const v = step.open === undefined ? (count === 1 ? "tab" : "none") : String(step.open).toLowerCase();
+    return v === "false" || v === "no" ? "none" : v;
+  }
+
+  // ----- links -----
+
+  fm(file) {
+    const c = this.app.metadataCache.getFileCache(file);
+    return (c && c.frontmatter) || {};
+  }
+  linkTo(file) {
+    return `[[${file.path.replace(/\.md$/, "")}|${linkAlias(displayTitle(file))}]]`;
+  }
+  resolve(raw, from) {
+    const { linkpath } = parseLink(raw);
+    if (!linkpath) return null;
+    return this.app.metadataCache.getFirstLinkpathDest(linkpath, from.path);
+  }
+  has(list, target, from) {
+    return asList(list).some((x) => { const f = this.resolve(x, from); return f && f.path === target.path; });
+  }
+  withLink(list, target, from) {
+    const l = asList(list);
+    return this.has(l, target, from) ? l : [...l, this.linkTo(target)];
+  }
+  withoutLink(list, target, from) {
+    return asList(list).filter((x) => { const f = this.resolve(x, from); return !(f && f.path === target.path); });
+  }
+  linkedFiles(list, from) {
+    const out = [];
+    for (const x of asList(list)) {
+      const f = this.resolve(x, from);
+      if (f instanceof obsidian.TFile && !out.some((o) => o.path === f.path)) out.push(f);
+    }
+    return out;
+  }
+
+  // ----- templates -----
+
+  async readTemplate(path) {
+    if (!path) return { fm: {}, body: "" };
+    const norm = obsidian.normalizePath(String(path).endsWith(".md") ? String(path) : String(path) + ".md");
+    let t = this.app.vault.getAbstractFileByPath(norm);
+    if (!(t instanceof obsidian.TFile)) t = this.app.metadataCache.getFirstLinkpathDest(String(path).replace(/\.md$/, ""), "");
+    if (!(t instanceof obsidian.TFile)) {
+      new obsidian.Notice(`Template "${path}" not found; creating a blank note.`);
+      return { fm: {}, body: "" };
+    }
+    const text = await this.app.vault.read(t);
+    const c = this.app.metadataCache.getFileCache(t);
+    const end = c && c.frontmatterPosition ? c.frontmatterPosition.end.offset : -1;
+    let body = text;
+    if (end >= 0) body = text.slice(end).replace(/^\s*---\s*\r?\n?/, "").replace(/^\r?\n/, "");
+    else body = text.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "");
+    const fm = JSON.parse(JSON.stringify((c && c.frontmatter) || {}));
+    return { fm, body };
+  }
+
+  // ----- actions -----
+
+  // Notion: "Add page to RM Tasks as <template>", with Parent task = This page for sub-tasks
+  async createNote(cfg, step, from, asChild) {
+    const fromFm = this.fm(from);
+    const tplPath = step.template !== undefined ? step.template : (asChild ? DEFAULT_SUBTASK_TEMPLATE : "");
+    const tpl = await this.readTemplate(tplPath);
+    const folder = step.folder ? obsidian.normalizePath(String(step.folder)) : (from.parent ? from.parent.path : "");
+    const tplName = tplPath ? String(tplPath).split("/").pop().replace(/\.md$/, "") : "";
+    // Notion keeps the title as typed; the file gets a safe, unique name and the title goes in a property
+    const title = expandVars(step.name || (asChild ? "Subtask" : tplName || "Untitled"), from).replace(/\s+/g, " ").trim() || "Untitled";
+    const note = await this.app.vault.create(uniqueNotePath(this.app, folder, safeFileName(title)), expandVars(tpl.body || "", from));
+    await this.app.fileManager.processFrontMatter(note, (fm) => {
+      for (const [k, v] of Object.entries(tpl.fm)) if (!TEMPLATE_SKIP_KEYS.has(k)) fm[k] = v;
+      fm[TITLE_KEY] = title;
+      if (fromFm.base) fm.base = fromFm.base;
+      if (asChild) fm[cfg.parentProperty] = [this.linkTo(from)];
+      for (const [k, v] of Object.entries(step.properties || {})) fm[k] = typeof v === "string" ? expandVars(v, from) : v;
+      if (cfg.statusProperty && (fm[cfg.statusProperty] === undefined || fm[cfg.statusProperty] === "")) fm[cfg.statusProperty] = "Not started";
+    });
+    if (asChild) {
+      // the other side of the two-way relation (Obsidian doesn't keep it in sync on its own)
+      await this.app.fileManager.processFrontMatter(from, (fm) => {
+        fm[cfg.subtaskProperty] = this.withLink(fm[cfg.subtaskProperty], note, from);
+      });
+    }
+    return note;
+  }
+
+  // Notion: Completed Tasks += parent, Parent task -= parent, Status = Closed
+  async completeSubtask(cfg, step, child) {
+    const parents = this.linkedFiles(this.fm(child)[cfg.parentProperty], child);
+    const status = step.status === undefined ? "Closed" : step.status;
+    await this.app.fileManager.processFrontMatter(child, (fm) => {
+      let done = asList(fm[cfg.completedProperty]);
+      for (const p of parents) done = this.withLink(done, p, child);
+      if (cfg.completedProperty) fm[cfg.completedProperty] = done;
+      let left = asList(fm[cfg.parentProperty]);
+      for (const p of parents) left = this.withoutLink(left, p, child);
+      fm[cfg.parentProperty] = left;
+      if (cfg.statusProperty && status) fm[cfg.statusProperty] = Array.isArray(fm[cfg.statusProperty]) ? [status] : status;
+    });
+    for (const p of parents) {
+      await this.app.fileManager.processFrontMatter(p, (fm) => {
+        fm[cfg.subtaskProperty] = this.withoutLink(fm[cfg.subtaskProperty], child, p);
+        if (cfg.completedProperty) fm[cfg.completedProperty] = this.withLink(fm[cfg.completedProperty], child, p);
+      });
+    }
+    new obsidian.Notice(parents.length ? `Moved to Completed Tasks of "${parents.map((p) => displayTitle(p)).join('", "')}"` : `Set to ${status} (no parent task)`);
+  }
+
+  // Notion: Sub-task -= all (the two-way relation clears each child's Parent task)
+  async unparentAll(cfg, parent) {
+    const children = this.linkedFiles(this.fm(parent)[cfg.subtaskProperty], parent);
+    await this.app.fileManager.processFrontMatter(parent, (fm) => { fm[cfg.subtaskProperty] = []; });
+    for (const c of children) {
+      await this.app.fileManager.processFrontMatter(c, (fm) => {
+        fm[cfg.parentProperty] = this.withoutLink(fm[cfg.parentProperty], parent, c);
+      });
+    }
+    new obsidian.Notice(`Un-parented ${children.length} sub-task${children.length === 1 ? "" : "s"}`);
+  }
+
+  matches(file, fm, rule) {
+    const prop = String(rule.property || "");
+    const raw = prop === "file.name" || prop.toLowerCase() === "name" ? displayTitle(file) : fm[prop];
+    const vals = asList(raw).map((v) => {
+      const s = asString(v);
+      const l = parseLink(s);
+      return (l.alias || (s.startsWith("[[") ? l.linkpath.split("/").pop() : s)).toLowerCase();
+    });
+    const want = String(rule.value === undefined || rule.value === null ? "" : rule.value).toLowerCase();
+    const any = want.split(",").map((x) => x.trim()).filter(Boolean);
+    switch (String(rule.op || "contains")) {
+      case "contains": return vals.some((v) => v === want || (vals.length === 1 && v.includes(want)));
+      case "not-contains": return !vals.some((v) => v === want || (vals.length === 1 && v.includes(want)));
+      case "is": return vals.length === 1 ? vals[0] === want : vals.includes(want);
+      case "is-not": return !(vals.length === 1 ? vals[0] === want : vals.includes(want));
+      case "is-any": return vals.some((v) => any.includes(v));
+      case "starts-with": return vals.some((v) => v.startsWith(want));
+      case "not-starts-with": return !vals.some((v) => v.startsWith(want));
+      case "is-empty": return vals.length === 0;
+      case "not-empty": return vals.length > 0;
+      default: return false;
+    }
+  }
+
+  // Notion: "Edit tasks that match <filters> in RM Tasks: Parent task = This page"
+  async adoptMatching(cfg, step, parent) {
+    const parentFm = this.fm(parent);
+    const sameBase = parentFm.base ? asString(parentFm.base) : null;
+    const rules = asList(step.where);
+    const hits = [];
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      if (f.path === parent.path) continue;
+      const fm = this.fm(f);
+      if (sameBase ? asString(fm.base) !== sameBase : (f.parent && parent.parent && f.parent.path !== parent.parent.path)) continue;
+      if (rules.every((r) => this.matches(f, fm, r))) hits.push(f);
+    }
+    for (const c of hits) {
+      const oldParents = this.linkedFiles(this.fm(c)[cfg.parentProperty], c).filter((p) => p.path !== parent.path);
+      await this.app.fileManager.processFrontMatter(c, (fm) => { fm[cfg.parentProperty] = [this.linkTo(parent)]; });
+      for (const op of oldParents) {
+        await this.app.fileManager.processFrontMatter(op, (fm) => { fm[cfg.subtaskProperty] = this.withoutLink(fm[cfg.subtaskProperty], c, op); });
+      }
+    }
+    await this.app.fileManager.processFrontMatter(parent, (fm) => {
+      let list = asList(fm[cfg.subtaskProperty]);
+      for (const c of hits) list = this.withLink(list, c, parent);
+      fm[cfg.subtaskProperty] = list;
+    });
+    new obsidian.Notice(`Added ${hits.length} matching task${hits.length === 1 ? "" : "s"} as sub-tasks`);
+  }
+
+  // Notion: "Edit This page: <property> set / add / remove <value>"
+  async editProperties(step, file) {
+    const changes = asList(step.changes);
+    await this.app.fileManager.processFrontMatter(file, (fm) => {
+      for (const ch of changes) {
+        const key = ch && ch.property;
+        if (!key) continue;
+        const mode = String(ch.mode || "set").toLowerCase();
+        const value = typeof ch.value === "string" ? expandVars(ch.value, file) : ch.value;
+        const values = asList(value).map((v) => (typeof v === "string" ? v : v));
+        if (mode === "add") {
+          const cur = asList(fm[key]);
+          for (const v of values) if (!cur.some((c) => asString(c).toLowerCase() === asString(v).toLowerCase())) cur.push(v);
+          fm[key] = cur;
+        } else if (mode === "remove") {
+          if (Array.isArray(fm[key])) fm[key] = fm[key].filter((c) => !values.some((v) => asString(c).toLowerCase() === asString(v).toLowerCase()));
+          else if (values.some((v) => asString(fm[key]).toLowerCase() === asString(v).toLowerCase())) fm[key] = "";
+        } else if (mode === "clear") {
+          fm[key] = Array.isArray(fm[key]) ? [] : "";
+        } else {
+          fm[key] = Array.isArray(fm[key]) && !Array.isArray(value) ? asList(value) : value;
+        }
+      }
+    });
+  }
+
+  async renameNote(step, file) {
+    await this.plugin.setDisplayTitle(file, expandVars(step.name || displayTitle(file), file));
+  }
+
+  // Notion: "Insert blocks above/below button"
+  async insertText(step, file, el, ctx) {
+    const text = expandVars(step.text || "", file).replace(/\s+$/, "");
+    if (!text) return;
+    const info = ctx && el ? ctx.getSectionInfo(el) : null;
+    const pos = String(step.position || "above").toLowerCase();
+    const below = pos === "below";
+    await this.app.vault.process(file, (data) => {
+      const nl = data.includes("\r\n") ? "\r\n" : "\n";
+      const lines = data.split(/\r?\n/);
+      const add = text.split(/\r?\n/);
+      if (pos === "top") {
+        // Notion: "top of page" = right under the properties (and under the comments section)
+        let at = 0;
+        if (lines[0] === "---") { const end = lines.indexOf("---", 1); if (end > 0) at = end + 1; }
+        let k = at;
+        while (k < lines.length && !lines[k].trim()) k++;
+        if ((lines[k] || "").includes("notion-comments:start")) {
+          const end = lines.findIndex((l, j) => j > k && l.includes("notion-comments:end"));
+          if (end > 0) at = end + 1;
+        }
+        lines.splice(at, 0, ...(at > 0 && lines[at - 1].trim() && lines[at - 1] !== "---" ? [""] : []), ...add, "");
+        return lines.join(nl);
+      }
+      if (!info) return data.replace(/\s*$/, "") + nl + add.join(nl) + nl;
+      const at = below ? info.lineEnd + 1 : info.lineStart;
+      lines.splice(at, 0, ...add);
+      return lines.join(nl);
+    });
+  }
+}
+
+// ----- "Insert button": pick a ready-made button or start a new one -----
+
+class ButtonPickerModal extends obsidian.SuggestModal {
+  constructor(buttons, onPick) {
+    super(buttons.app);
+    this.buttons = buttons;
+    this.onPick = onPick;
+    this.setPlaceholder("Insert a button… (type to filter)");
+    this.setInstructions([{ command: "↵", purpose: "insert" }, { command: "esc", purpose: "cancel" }]);
+  }
+
+  getSuggestions(query) {
+    const q = query.trim().toLowerCase();
+    const { builtin, mine } = this.buttons.library();
+    const items = [{ kind: "new", label: "New button…", description: "Build a button step by step, like Notion" }];
+    for (const b of mine) items.push({ kind: "mine", label: b.label, btn: b });
+    for (const b of builtin) items.push({ kind: "builtin", label: b.label, btn: b });
+    return items.filter((it) => !q || it.label.toLowerCase().includes(q) || it.kind === "new");
+  }
+
+  renderSuggestion(it, el) {
+    el.addClass("nk-button-suggestion");
+    const icon = el.createSpan({ cls: "nk-button-suggestion-icon" });
+    if (it.kind === "new") obsidian.setIcon(icon, "plus");
+    else if (it.btn.icon) renderIconValue(icon, String(it.btn.icon));
+    else obsidian.setIcon(icon, "mouse-pointer-click");
+    const text = el.createDiv({ cls: "nk-button-suggestion-text" });
+    text.createDiv({ cls: "nk-button-suggestion-title", text: it.label });
+    const desc = it.kind === "new" ? it.description : (it.btn.description || this.summary(it.btn));
+    if (desc) text.createDiv({ cls: "nk-button-suggestion-desc", text: desc });
+    if (it.kind === "mine") {
+      el.createSpan({ cls: "nk-button-suggestion-badge", text: "My button" });
+      const del = el.createSpan({ cls: "nk-button-suggestion-del clickable-icon", attr: { "aria-label": "Remove from My buttons" } });
+      obsidian.setIcon(del, "trash-2");
+      del.addEventListener("click", async (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        await this.buttons.removeFromLibrary(it.label);
+        this.inputEl.dispatchEvent(new Event("input"));
+      });
+    }
+  }
+
+  summary(btn) {
+    const steps = normalizeButton(btn).steps;
+    return steps.map((s) => (STEP_TYPE[s.action] ? STEP_TYPE[s.action].name : s.action)).join(" → ");
+  }
+
+  onChooseSuggestion(it) {
+    this.onPick(it.kind === "new" ? null : it.btn);
+  }
+}
+
+// ----- the step builder (Notion's "When button is clicked / Do") -----
+
+class ButtonBuilderModal extends obsidian.Modal {
+  constructor(buttons, initial, onDone) {
+    super(buttons.app);
+    this.buttons = buttons;
+    this.onDone = onDone;
+    const start = initial ? normalizeButton(JSON.parse(JSON.stringify(initial))) : { label: "", steps: [] };
+    this.btn = {
+      label: start.label || "",
+      icon: start.icon || "",
+      description: start.description || "",
+      confirm: start.confirm || "",
+      confirmText: start.confirmText || "",
+      steps: (start.steps || []).map((s) => Object.assign({}, s)),
+    };
+    for (const k of BUTTON_KEYS) if (start[k] && start[k] !== BUTTON_DEFAULTS[k]) this.btn[k] = start[k];
+    this.editing = !!initial;
+    this.saveToLibrary = false;
+  }
+
+  onOpen() {
+    this.modalEl.addClass("nk-button-builder");
+    this.titleEl.setText(this.editing ? "Edit button" : "New button");
+    this.draw();
+  }
+
+  onClose() { this.contentEl.empty(); }
+
+  templateFiles() {
+    return this.app.vault.getMarkdownFiles().filter((f) => /(^|\/)templates?\//i.test(f.path)).map((f) => f.path).sort();
+  }
+
+  draw() {
+    const c = this.contentEl;
+    c.empty();
+    const b = this.btn;
+
+    new obsidian.Setting(c).setName("Button name").addText((t) => t.setPlaceholder("Add subtask").setValue(b.label).onChange((v) => { b.label = v; }));
+    new obsidian.Setting(c)
+      .setName("Icon")
+      .setDesc("Optional. A Lucide icon name with an optional color (plus, check:green) or an emoji.")
+      .addText((t) => t.setPlaceholder("plus").setValue(b.icon).onChange((v) => { b.icon = v.trim(); }));
+
+    c.createDiv({ cls: "nk-bb-section", text: "When" });
+    const when = c.createDiv({ cls: "nk-bb-card nk-bb-when" });
+    obsidian.setIcon(when.createSpan({ cls: "nk-bb-card-icon" }), "mouse-pointer-click");
+    when.createSpan({ text: "Button is clicked" });
+
+    c.createDiv({ cls: "nk-bb-section", text: "Do" });
+    const confirmCard = c.createDiv({ cls: "nk-bb-card" });
+    new obsidian.Setting(confirmCard)
+      .setName("Show confirmation")
+      .addToggle((t) => t.setValue(!!b.confirm).onChange((v) => { b.confirm = v ? (b.confirm || "Are you sure?") : ""; this.draw(); }));
+    if (b.confirm) {
+      new obsidian.Setting(confirmCard).setName("Confirmation message").addText((t) => t.setValue(b.confirm).onChange((v) => { b.confirm = v || "Are you sure?"; }));
+      new obsidian.Setting(confirmCard).setName("Continue button text").addText((t) => t.setPlaceholder("Continue").setValue(b.confirmText || "").onChange((v) => { b.confirmText = v.trim(); }));
+    }
+
+    b.steps.forEach((step, i) => this.drawStep(c, step, i));
+
+    const addRow = c.createDiv({ cls: "nk-bb-add" });
+    const add = addRow.createEl("button", { cls: "nk-bb-add-btn" });
+    obsidian.setIcon(add.createSpan({ cls: "nk-bb-card-icon" }), "plus");
+    add.createSpan({ text: "Add action" });
+    add.onclick = (ev) => {
+      const menu = new obsidian.Menu();
+      for (const t of STEP_TYPES) {
+        menu.addItem((item) => item.setTitle(t.name).setIcon(t.icon).onClick(() => {
+          b.steps.push(this.newStep(t.id));
+          this.draw();
+        }));
+      }
+      menu.showAtMouseEvent(ev);
+    };
+
+    const foot = c.createDiv({ cls: "nk-bb-foot" });
+    new obsidian.Setting(foot)
+      .setName("Save to My buttons")
+      .setDesc("Adds it to the Insert button list so you can reuse it on other pages.")
+      .addToggle((t) => t.setValue(this.saveToLibrary).onChange((v) => { this.saveToLibrary = v; }));
+    const row = foot.createDiv({ cls: "modal-button-container" });
+    const done = row.createEl("button", { cls: "mod-cta", text: this.editing ? "Done" : "Insert" });
+    done.onclick = async () => {
+      if (!b.label.trim()) { new obsidian.Notice("Give the button a name first."); return; }
+      if (!b.steps.length) { new obsidian.Notice("Add at least one action."); return; }
+      const out = Object.assign({}, b, { label: b.label.trim() });
+      if (this.saveToLibrary) await this.buttons.saveToLibrary(out);
+      this.close();
+      this.onDone(out);
+    };
+    const cancel = row.createEl("button", { text: "Cancel" });
+    cancel.onclick = () => this.close();
+  }
+
+  newStep(id) {
+    if (id === "add-subtask") return { action: id, name: "Subtask", template: DEFAULT_SUBTASK_TEMPLATE, open: "tab" };
+    if (id === "add-task") return { action: id, name: "", template: "", open: "tab" };
+    if (id === "complete-subtask") return { action: id, status: "Closed" };
+    if (id === "adopt-matching") return { action: id, where: [{ property: "Tag", op: "contains", value: "" }] };
+    if (id === "edit-properties") return { action: id, changes: [{ property: "Tag", mode: "add", value: "" }] };
+    if (id === "rename") return { action: id, name: "{{title}}" };
+    if (id === "insert") return { action: id, text: "- [ ] ", position: "above" };
+    return { action: id };
+  }
+
+  drawStep(c, step, i) {
+    const b = this.btn;
+    const type = STEP_TYPE[step.action] || { name: step.action, icon: "help-circle", desc: "" };
+    const card = c.createDiv({ cls: "nk-bb-card nk-bb-step" });
+    const head = card.createDiv({ cls: "nk-bb-step-head" });
+    obsidian.setIcon(head.createSpan({ cls: "nk-bb-card-icon" }), type.icon);
+    head.createSpan({ cls: "nk-bb-step-title", text: type.name });
+    const tools = head.createDiv({ cls: "nk-bb-step-tools" });
+    const tool = (icon, label, fn, disabled) => {
+      const t = tools.createDiv({ cls: "clickable-icon" + (disabled ? " is-disabled" : ""), attr: { "aria-label": label } });
+      obsidian.setIcon(t, icon);
+      if (!disabled) t.onclick = fn;
+    };
+    tool("arrow-up", "Move up", () => { [b.steps[i - 1], b.steps[i]] = [b.steps[i], b.steps[i - 1]]; this.draw(); }, i === 0);
+    tool("arrow-down", "Move down", () => { [b.steps[i + 1], b.steps[i]] = [b.steps[i], b.steps[i + 1]]; this.draw(); }, i === b.steps.length - 1);
+    tool("trash-2", "Delete action", () => { b.steps.splice(i, 1); this.draw(); });
+    if (type.desc) card.createDiv({ cls: "nk-bb-step-desc", text: type.desc });
+
+    const text = (name, key, placeholder, desc) =>
+      new obsidian.Setting(card).setName(name).setDesc(desc || "").addText((t) => t.setPlaceholder(placeholder || "").setValue(step[key] === undefined ? "" : String(step[key])).onChange((v) => { step[key] = v; }));
+    const templateField = () => {
+      const s = new obsidian.Setting(card).setName("Template").setDesc("A note whose properties and content are copied into the new note.");
+      s.addText((t) => {
+        t.setPlaceholder("Templates/RM Tasks/RM Sub-task.md").setValue(step.template || "").onChange((v) => { step.template = v.trim(); });
+        const listId = "nk-bb-templates-" + Math.random().toString(36).slice(2);
+        const dl = card.createEl("datalist", { attr: { id: listId } });
+        for (const p of this.templateFiles()) dl.createEl("option", { attr: { value: p } });
+        t.inputEl.setAttr("list", listId);
+        t.inputEl.addClass("nk-bb-wide");
+      });
+    };
+    const openField = () =>
+      new obsidian.Setting(card).setName("Then").addDropdown((d) => d
+        .addOption("tab", "Open it in a new tab")
+        .addOption("split", "Open it to the right")
+        .addOption("none", "Don't open it")
+        .setValue(step.open || "tab")
+        .onChange((v) => { step.open = v; }));
+    const propsField = () => {
+      const s = new obsidian.Setting(card).setName("Also set").setDesc("One per line, like  Team: Personal");
+      s.addTextArea((t) => {
+        t.setPlaceholder("Team: Release Management").setValue(Object.entries(step.properties || {}).map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(", ") : v}`).join("\n"));
+        t.onChange((v) => {
+          const props = {};
+          for (const line of v.split(/\r?\n/)) {
+            const at = line.indexOf(":");
+            if (at > 0) props[line.slice(0, at).trim()] = line.slice(at + 1).trim();
+          }
+          step.properties = props;
+        });
+      });
+    };
+
+    switch (step.action) {
+      case "add-subtask":
+        text("Name", "name", "Subtask", "Use {{title}} for this page's name, {{today:MM-DD-YYYY}} for a date.");
+        templateField();
+        propsField();
+        openField();
+        break;
+      case "add-task":
+        text("Name", "name", "Leave empty to use the template's name");
+        templateField();
+        propsField();
+        openField();
+        break;
+      case "complete-subtask":
+        text("Set status to", "status", "Closed");
+        break;
+      case "unparent-all":
+        break;
+      case "adopt-matching": {
+        step.where = asList(step.where);
+        card.createDiv({ cls: "nk-bb-step-sub", text: "Tasks in the same database where every filter matches:" });
+        step.where.forEach((rule, k) => {
+          const s = new obsidian.Setting(card).setClass("nk-bb-rule");
+          s.addText((t) => t.setPlaceholder("Property (or file.name)").setValue(rule.property || "").onChange((v) => { rule.property = v.trim(); }));
+          s.addDropdown((d) => {
+            for (const [id, label] of FILTER_OPS) d.addOption(id, label);
+            d.setValue(rule.op || "contains").onChange((v) => { rule.op = v; this.draw(); });
+          });
+          if (!["is-empty", "not-empty"].includes(rule.op)) s.addText((t) => t.setPlaceholder("Value").setValue(rule.value === undefined ? "" : String(rule.value)).onChange((v) => { rule.value = v; }));
+          s.addExtraButton((x) => x.setIcon("x").setTooltip("Remove filter").onClick(() => { step.where.splice(k, 1); this.draw(); }));
+        });
+        new obsidian.Setting(card).addButton((x) => x.setButtonText("Add filter").onClick(() => { step.where.push({ property: "", op: "contains", value: "" }); this.draw(); }));
+        break;
+      }
+      case "edit-properties": {
+        step.changes = asList(step.changes);
+        step.changes.forEach((ch, k) => {
+          const s = new obsidian.Setting(card).setClass("nk-bb-rule");
+          s.addText((t) => t.setPlaceholder("Property").setValue(ch.property || "").onChange((v) => { ch.property = v.trim(); }));
+          s.addDropdown((d) => d
+            .addOption("set", "set to")
+            .addOption("add", "add")
+            .addOption("remove", "remove")
+            .addOption("clear", "clear")
+            .setValue(ch.mode || "set")
+            .onChange((v) => { ch.mode = v; this.draw(); }));
+          if (ch.mode !== "clear") s.addText((t) => t.setPlaceholder("Value").setValue(ch.value === undefined ? "" : asString(ch.value)).onChange((v) => { ch.value = v; }));
+          s.addExtraButton((x) => x.setIcon("x").setTooltip("Remove").onClick(() => { step.changes.splice(k, 1); this.draw(); }));
+        });
+        new obsidian.Setting(card).addButton((x) => x.setButtonText("Edit another property").onClick(() => { step.changes.push({ property: "", mode: "set", value: "" }); this.draw(); }));
+        break;
+      }
+      case "rename":
+        text("New name", "name", "1-1 Meeting {{next:tuesday:MM-DD-YYYY}}", "{{title}} = current name, {{today:FORMAT}}, {{next:tuesday:FORMAT}} = the coming Tuesday (today counts), {{next:tuesday+1:FORMAT}} = a week after that.");
+        break;
+      case "insert": {
+        new obsidian.Setting(card).setName("Text").addTextArea((t) => {
+          t.setValue(step.text || "").onChange((v) => { step.text = v; });
+          t.inputEl.rows = 4;
+          t.inputEl.addClass("nk-bb-wide");
+        });
+        new obsidian.Setting(card).setName("Where").addDropdown((d) => d
+          .addOption("above", "Above the button")
+          .addOption("below", "Below the button")
+          .addOption("top", "Top of the page")
+          .setValue(step.position || "above")
+          .onChange((v) => { step.position = v; }));
+        break;
+      }
+      default:
+        card.createDiv({ cls: "nk-bb-step-sub", text: "This action can only be edited in the code block." });
+    }
+  }
+}
+
+// ---------- Notion-style comments under the properties ----------
+//
+// Comments live in the note body, right after the frontmatter, as callouts:
+//   > [!comment|page] Comment                 (page comments, one thread)
+//   > [!comment] On “highlighted text”         (an imported inline comment thread)
+//   > **Name** · Dec 12, 2025, 1:43 PM
+//   > comment text
+//   >
+//   > **Name** · ...
+// The panel shows them Notion-style and hides the raw callouts; without the
+// plugin they still read fine as ordinary callouts.
+
+const COMMENT_TIME_FORMAT = "MMM D, YYYY, h:mm A";
+const COMMENT_HEAD_RE = /^\*\*(.+?)\*\* · (.+)$/;
+const CALLOUT_START_RE = /^>\s*\[!comment(?:\|([^\]]*))?\][+-]?\s*(.*)$/i;
+
+function splitFrontmatter(text) {
+  const m = /^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/.exec(text);
+  return m ? m[0].length : 0;
+}
+
+// Find the run of comment callouts at the top of the body.
+// Returns { bodyStart, start, end, threads:[{ kind, title, lineStart, lineEnd, comments:[{author, time, text, lineStart, lineEnd}] }] }
+// where line numbers index into `lines` (the whole file split on \n).
+function parseComments(text) {
+  const lines = text.split("\n");
+  const fmLen = splitFrontmatter(text);
+  let i = fmLen ? text.slice(0, fmLen).split("\n").length - 1 : 0;
+  if (fmLen && !text.slice(0, fmLen).endsWith("\n")) i += 1;
+  const bodyStart = i;
+  const threads = [];
+  let j = i;
+  while (j < lines.length && lines[j].trim() === "") j++;
+  const start = j;
+  let end = start;
+  while (j < lines.length) {
+    const m = CALLOUT_START_RE.exec(lines[j].replace(/\r$/, ""));
+    if (!m) break;
+    const meta = (m[1] || "").trim().toLowerCase();
+    const t = { kind: meta === "page" ? "page" : "inline", title: m[2].trim(), lineStart: j, comments: [] };
+    j++;
+    let cur = null;
+    while (j < lines.length && /^>/.test(lines[j])) {
+      const raw = lines[j].replace(/\r$/, "").replace(/^>\s?/, "");
+      const h = COMMENT_HEAD_RE.exec(raw.trim());
+      if (h) {
+        cur = { author: h[1], time: h[2], body: [], lineStart: j, lineEnd: j + 1 };
+        t.comments.push(cur);
+      } else if (cur) {
+        cur.body.push(raw);
+        cur.lineEnd = j + 1;
+      }
+      j++;
+    }
+    t.lineEnd = j;
+    for (const c of t.comments) {
+      c.text = c.body.join("\n").trim();
+      delete c.body;
+    }
+    threads.push(t);
+    end = j;
+    while (j < lines.length && lines[j].trim() === "") j++;
+  }
+  return { lines, bodyStart, start, end, threads };
+}
+
+function quoteLines(text) {
+  return text.split(/\r?\n/).map((l) => (l ? "> " + l : ">"));
+}
+
+function initials(name) {
+  const parts = String(name || "?").trim().split(/\s+/);
+  return ((parts[0] || "?")[0] + (parts.length > 1 ? parts[parts.length - 1][0] : "")).toUpperCase();
+}
+
+// "[[" link suggestions for plain textareas (comment boxes), modeled on
+// Obsidian's editor link suggester: type [[, pick a note, get [[link]].
+class TextareaLinkSuggest {
+  constructor(app, textarea, sourcePath) {
+    this.app = app;
+    this.el = textarea;
+    this.sourcePath = sourcePath || "";
+    this.popup = null;
+    this.items = [];
+    this.selected = 0;
+    this.start = -1;
+    const refresh = () => this.update();
+    textarea.addEventListener("input", refresh);
+    textarea.addEventListener("click", refresh);
+    textarea.addEventListener("blur", () => window.setTimeout(() => this.close(), 150));
+  }
+
+  isOpen() { return !!this.popup; }
+
+  // Call first from the textarea's keydown handler; returns true when the
+  // key was used by the suggester (so the caller must not act on it).
+  handleKey(e) {
+    if (!this.popup) {
+      if (e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === "Home" || e.key === "End") window.setTimeout(() => this.update(), 0);
+      return false;
+    }
+    if (e.key === "ArrowDown" || (e.key === "n" && e.ctrlKey)) { this.move(1); e.preventDefault(); return true; }
+    if (e.key === "ArrowUp" || (e.key === "p" && e.ctrlKey)) { this.move(-1); e.preventDefault(); return true; }
+    if ((e.key === "Enter" && !e.isComposing) || e.key === "Tab") {
+      e.preventDefault();
+      if (this.items.length) this.choose(this.items[this.selected]); else this.close();
+      return true;
+    }
+    if (e.key === "Escape") { e.preventDefault(); this.close(); return true; }
+    if (e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === "Home" || e.key === "End") window.setTimeout(() => this.update(), 0);
+    return false;
+  }
+
+  update() {
+    const ta = this.el;
+    if (ta.selectionStart !== ta.selectionEnd) return this.close();
+    const caret = ta.selectionStart;
+    const before = ta.value.slice(0, caret);
+    const m = before.match(/\[\[([^\[\]\|#\n]*)$/);
+    if (!m) return this.close();
+    this.start = caret - m[0].length;
+    this.query = m[1];
+    this.items = this.search(m[1]);
+    this.selected = 0;
+    this.render();
+  }
+
+  search(query) {
+    const files = this.app.vault.getFiles().filter((f) => f.path !== this.sourcePath);
+    const q = query.trim();
+    const out = [];
+    if (!q) {
+      // Like Obsidian: most recently opened first, then most recently edited.
+      const recent = (this.app.workspace.getLastOpenFiles ? this.app.workspace.getLastOpenFiles() : []);
+      const byPath = new Map(files.map((f) => [f.path, f]));
+      const seen = new Set();
+      for (const p of recent) { const f = byPath.get(p); if (f && !seen.has(p)) { seen.add(p); out.push(f); } }
+      const rest = files.filter((f) => !seen.has(f.path)).sort((a, b) => b.stat.mtime - a.stat.mtime);
+      return out.concat(rest).slice(0, 20).map((f) => ({ file: f }));
+    }
+    const fuzzy = obsidian.prepareFuzzySearch(q);
+    const scored = [];
+    for (const f of files) {
+      const title = f.extension === "md" ? displayTitle(f, this.app) : f.name;
+      const name = f.extension === "md" ? f.basename : f.name;
+      let best = null;
+      for (const s of [title, name, f.path]) {
+        const r = fuzzy(s);
+        if (r && (!best || r.score > best.score)) best = r;
+      }
+      if (best) scored.push({ file: f, score: best.score + (f.extension === "md" ? 0 : -1) });
+    }
+    scored.sort((a, b) => b.score - a.score || a.file.path.length - b.file.path.length);
+    return scored.slice(0, 30);
+  }
+
+  render() {
+    if (!this.el.isConnected) return this.close();
+    if (!this.popup) {
+      // The panel can be rebuilt under us; drop the popup if the box goes away.
+      this.watch = window.setInterval(() => { if (!this.el.isConnected || document.activeElement !== this.el) this.close(); }, 300);
+      this.popup = document.body.createDiv({ cls: "suggestion-container nk-link-suggest" });
+      this.listEl = this.popup.createDiv({ cls: "suggestion" });
+    }
+    this.listEl.empty();
+    if (!this.items.length) {
+      this.listEl.createDiv({ cls: "suggestion-empty", text: "No match found" });
+    }
+    this.items.forEach((it, i) => {
+      const f = it.file;
+      const row = this.listEl.createDiv({ cls: "suggestion-item mod-complex" + (i === this.selected ? " is-selected" : "") });
+      const content = row.createDiv({ cls: "suggestion-content" });
+      const title = f.extension === "md" ? displayTitle(f, this.app) : f.name;
+      content.createDiv({ cls: "suggestion-title", text: title });
+      const folder = f.parent && f.parent.path !== "/" ? f.parent.path : "";
+      const note = title !== f.basename && f.extension === "md" ? (folder ? folder + "/" : "") + f.basename : folder;
+      if (note) content.createDiv({ cls: "suggestion-note", text: note });
+      row.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); this.choose(it); });
+      row.addEventListener("mousemove", () => { if (this.selected !== i) { this.selected = i; this.highlight(); } });
+    });
+    this.position();
+  }
+
+  highlight() {
+    const rows = this.listEl.querySelectorAll(".suggestion-item");
+    rows.forEach((r, i) => r.toggleClass("is-selected", i === this.selected));
+    const cur = rows[this.selected];
+    if (cur) cur.scrollIntoView({ block: "nearest" });
+  }
+
+  move(d) {
+    if (!this.items.length) return;
+    this.selected = (this.selected + d + this.items.length) % this.items.length;
+    this.highlight();
+  }
+
+  position() {
+    const r = this.el.getBoundingClientRect();
+    const p = this.popup;
+    p.style.position = "fixed";
+    p.style.left = Math.max(8, Math.min(r.left, window.innerWidth - 360)) + "px";
+    p.style.width = Math.max(280, Math.min(r.width, 420)) + "px";
+    const below = window.innerHeight - r.bottom;
+    if (below < 240 && r.top > below) {
+      p.style.top = "";
+      p.style.bottom = (window.innerHeight - r.top + 4) + "px";
+    } else {
+      p.style.bottom = "";
+      p.style.top = (r.bottom + 4) + "px";
+    }
+  }
+
+  choose(it) {
+    const ta = this.el;
+    const f = it.file;
+    const link = this.app.metadataCache.fileToLinktext(f, this.sourcePath, f.extension === "md");
+    const caret = ta.selectionStart;
+    let end = caret;
+    if (ta.value.slice(caret, caret + 2) === "]]") end += 2;
+    const text = "[[" + link + "]]";
+    ta.value = ta.value.slice(0, this.start) + text + ta.value.slice(end);
+    const pos = this.start + text.length;
+    ta.setSelectionRange(pos, pos);
+    this.close();
+    ta.focus();
+    ta.dispatchEvent(new Event("input"));
+  }
+
+  close() {
+    if (this.popup) { this.popup.remove(); this.popup = null; }
+    if (this.watch) { window.clearInterval(this.watch); this.watch = null; }
+    this.items = [];
+  }
+}
+
+class CommentsPanel {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.app = plugin.app;
+    this.refreshSoon = obsidian.debounce(() => this.refreshAll(), 80, true);
+  }
+
+  get author() {
+    return (this.plugin.settings.commentAuthor || "").trim() || "Me";
+  }
+
+  load() {
+    const p = this.plugin;
+    p.registerEvent(this.app.workspace.on("layout-change", () => this.refreshSoon()));
+    p.registerEvent(this.app.workspace.on("file-open", () => this.refreshSoon()));
+    p.registerEvent(this.app.workspace.on("active-leaf-change", () => this.refreshSoon()));
+    p.registerEvent(this.app.vault.on("modify", (f) => { if (f.extension === "md") this.refreshSoon(); }));
+    this.observer = new MutationObserver(() => this.refreshSoon());
+    this.app.workspace.onLayoutReady(() => this.refreshAll());
+    document.body.classList.add("nk-comments-on");
+  }
+
+  unload() {
+    if (this.observer) this.observer.disconnect();
+    document.body.classList.remove("nk-comments-on");
+    document.querySelectorAll(".nk-comments").forEach((e) => {
+      if (e._nkComponent) e._nkComponent.unload();
+      e.remove();
+    });
+  }
+
+  refreshAll() {
+    if (this.observer) this.observer.disconnect();
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const view = leaf.view;
+      if (!view || !view.file || !view.containerEl) continue;
+      this.renderInView(view);
+      if (this.observer) {
+        view.containerEl.querySelectorAll(".markdown-preview-sizer, .cm-sizer, .mod-header").forEach((h) => this.observer.observe(h, { childList: true }));
+      }
+    }
+  }
+
+  async renderInView(view) {
+    const file = view.file;
+    let text;
+    try {
+      text = await this.app.vault.cachedRead(file);
+    } catch (e) {
+      return;
+    }
+    const parsed = parseComments(text);
+    const key = file.path + "\u0000" + this.author + "\u0000" + JSON.stringify(parsed.threads.map((t) => [t.kind, t.title, t.comments]));
+    const hosts = view.containerEl.querySelectorAll(".markdown-source-view .cm-sizer, .markdown-preview-view .markdown-preview-sizer");
+    hosts.forEach((host) => {
+      const header = host.querySelector(":scope > .mod-header") || host;
+      const meta = header.querySelector(":scope > .metadata-container");
+      const before = meta ? meta.nextSibling : header.querySelector(":scope > .cm-contentContainer");
+      let panel = header.querySelector(":scope > .nk-comments");
+      if (!panel || (meta && panel.previousSibling !== meta)) {
+        if (panel) panel.remove();
+        panel = createDiv({ cls: "nk-comments" });
+        // keep the editor from taking over clicks and drags, so comment text can be selected and copied
+        for (const evt of ["mousedown", "pointerdown", "selectstart", "dragstart"]) {
+          panel.addEventListener(evt, (e) => e.stopPropagation());
+        }
+        header.insertBefore(panel, before || null);
+        panel.dataset.key = "";
+      }
+      if (panel.dataset.key === key) return;
+      if (panel.querySelector(".nk-comment.is-editing")) return;
+      // keep an unsent draft if the panel re-renders
+      const draftEl = panel.querySelector(".nk-comment-add .nk-comment-input");
+      const draft = draftEl && panel.dataset.path === file.path ? draftEl.value : "";
+      panel.dataset.key = key;
+      panel.dataset.path = file.path;
+      this.renderPanel(panel, file, parsed, draft);
+    });
+  }
+
+  renderPanel(panel, file, parsed, draft) {
+    if (panel._nkComponent) panel._nkComponent.unload();
+    const comp = new obsidian.Component();
+    comp.load();
+    panel._nkComponent = comp;
+    panel.empty();
+    const pageThreads = parsed.threads.filter((t) => t.kind === "page");
+    const inline = parsed.threads.filter((t) => t.kind !== "page");
+
+    const list = panel.createDiv({ cls: "nk-comments-list" });
+    const renderComment = (parent, c, thread, idx) => {
+      const row = parent.createDiv({ cls: "nk-comment" });
+      row.createDiv({ cls: "nk-comment-avatar", text: initials(c.author) });
+      const main = row.createDiv({ cls: "nk-comment-main" });
+      const head = main.createDiv({ cls: "nk-comment-head" });
+      head.createSpan({ cls: "nk-comment-author", text: c.author });
+      head.createSpan({ cls: "nk-comment-time", text: c.time });
+      const tools = head.createSpan({ cls: "nk-comment-tools" });
+      const edit = tools.createSpan({ cls: "nk-comment-tool nk-comment-edit-btn", attr: { "aria-label": "Edit comment" } });
+      setIconSafe(edit, ["pencil", "edit", "edit-3"]);
+      const del = tools.createSpan({ cls: "nk-comment-tool nk-comment-delete", attr: { "aria-label": "Delete comment" } });
+      setIconSafe(del, ["trash-2", "trash"]);
+      del.onclick = (ev) => {
+        ev.preventDefault();
+        new ConfirmModal(this.app, "Delete comment", "Delete this comment from the note?", "Delete", () => this.deleteComment(file, thread, idx)).open();
+      };
+      const body = main.createDiv({ cls: "nk-comment-body markdown-rendered" });
+      const showBody = () => {
+        body.empty();
+        obsidian.MarkdownRenderer.render(this.app, c.text, body, file.path, comp).then(() => this.linkNotionMentions(body, file));
+      };
+      showBody();
+      edit.onclick = (ev) => {
+        ev.preventDefault();
+        if (row.hasClass("is-editing")) return;
+        row.addClass("is-editing");
+        body.empty();
+        const box = body.createEl("textarea", { cls: "nk-comment-input nk-comment-edit" });
+        box.value = c.text;
+        const bar = body.createDiv({ cls: "nk-comment-edit-bar" });
+        const cancel = bar.createEl("button", { text: "Cancel" });
+        const save = bar.createEl("button", { cls: "mod-cta", text: "Save" });
+        const grow = () => { box.style.height = "auto"; box.style.height = box.scrollHeight + "px"; };
+        const close = () => { row.removeClass("is-editing"); showBody(); };
+        const commit = async () => {
+          const value = box.value.trim();
+          if (!value) return;
+          if (value === c.text) return close();
+          row.removeClass("is-editing");
+          await this.editComment(file, thread, idx, c, value);
+        };
+        const boxSuggest = new TextareaLinkSuggest(this.app, box, file.path);
+        box.addEventListener("input", grow);
+        box.addEventListener("keydown", (e) => {
+          e.stopPropagation();
+          if (boxSuggest.handleKey(e)) return;
+          if (e.key === "Escape") { e.preventDefault(); close(); }
+          else if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); commit(); }
+        });
+        cancel.onclick = (e) => { e.preventDefault(); close(); };
+        save.onclick = (e) => { e.preventDefault(); commit(); };
+        window.setTimeout(() => { grow(); box.focus(); box.setSelectionRange(box.value.length, box.value.length); }, 0);
+      };
+    };
+    for (const t of pageThreads) t.comments.forEach((c, i) => renderComment(list, c, t, i));
+    for (const t of inline) {
+      const box = list.createDiv({ cls: "nk-comment-thread" });
+      const q = t.title.replace(/^On\s+/, "").replace(/^[“"]|[”"]$/g, "");
+      if (q) box.createDiv({ cls: "nk-comment-quote", text: q });
+      t.comments.forEach((c, i) => renderComment(box, c, t, i));
+    }
+
+    const add = panel.createDiv({ cls: "nk-comment nk-comment-add" });
+    add.createDiv({ cls: "nk-comment-avatar", text: initials(this.author) });
+    const input = add.createEl("textarea", { cls: "nk-comment-input", attr: { rows: "1", placeholder: "Add a comment..." } });
+    input.value = draft || "";
+    const send = add.createDiv({ cls: "nk-comment-send", attr: { "aria-label": "Send" } });
+    setIconSafe(send, ["arrow-up-circle", "circle-arrow-up", "send"]);
+    const grow = () => {
+      input.style.height = "auto";
+      input.style.height = input.scrollHeight + "px";
+      add.toggleClass("has-text", !!input.value.trim());
+    };
+    const submit = async () => {
+      const value = input.value.trim();
+      if (!value) return;
+      input.value = "";
+      grow();
+      await this.addComment(file, value);
+    };
+    const inputSuggest = new TextareaLinkSuggest(this.app, input, file.path);
+    input.addEventListener("input", grow);
+    input.addEventListener("keydown", (ev) => {
+      ev.stopPropagation();
+      if (inputSuggest.handleKey(ev)) return;
+      if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) {
+        ev.preventDefault();
+        submit();
+      }
+    });
+    send.onclick = (ev) => { ev.preventDefault(); submit(); };
+    window.setTimeout(grow, 0);
+  }
+
+  async addComment(file, value) {
+    const head = `> **${this.author}** · ${window.moment().format(COMMENT_TIME_FORMAT)}`;
+    const newLines = [head, ...quoteLines(value)];
+    await this.app.vault.process(file, (text) => {
+      const p = parseComments(text);
+      const lines = p.lines;
+      const page = p.threads.filter((t) => t.kind === "page").pop();
+      if (page) {
+        lines.splice(page.lineEnd, 0, ">", ...newLines);
+      } else {
+        const block = ["> [!comment|page] Comment", ...newLines, ""];
+        const at = p.threads.length ? p.start : p.bodyStart;
+        // one blank line between the comments and the page content
+        if (at < lines.length && lines[at].trim() === "") block.pop();
+        lines.splice(at, 0, ...block);
+      }
+      return lines.join("\n");
+    });
+  }
+
+  async editComment(file, thread, idx, before, value) {
+    await this.app.vault.process(file, (text) => {
+      const p = parseComments(text);
+      const t = p.threads.find((x) => x.lineStart === thread.lineStart && x.title === thread.title) || p.threads.find((x) => x.title === thread.title);
+      let c = t && t.comments[idx];
+      if (!c || c.author !== before.author || c.time !== before.time) {
+        c = t && t.comments.find((x) => x.author === before.author && x.time === before.time && x.text === before.text);
+      }
+      if (!c) {
+        new obsidian.Notice("That comment changed in the note, so it wasn't saved. Try again.");
+        return text;
+      }
+      p.lines.splice(c.lineStart + 1, c.lineEnd - c.lineStart - 1, ...quoteLines(value));
+      return p.lines.join("\n");
+    });
+  }
+
+  // notion page id (no dashes, lower case) -> vault note
+  notionIndex() {
+    if (this._notionIndex) return this._notionIndex;
+    const map = new Map();
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      const fm = (this.app.metadataCache.getFileCache(f) || {}).frontmatter;
+      const id = fm && fm["notion-id"];
+      if (id) map.set(String(id).replace(/-/g, "").toLowerCase(), f);
+    }
+    this._notionIndex = map;
+    if (!this._notionIndexHooked) {
+      this._notionIndexHooked = true;
+      const reset = () => { this._notionIndex = null; };
+      this.plugin.registerEvent(this.app.metadataCache.on("changed", reset));
+      this.plugin.registerEvent(this.app.vault.on("rename", reset));
+      this.plugin.registerEvent(this.app.vault.on("delete", reset));
+    }
+    return map;
+  }
+
+  // Imported mentions of Notion pages are links to notion.so. When that page is
+  // a note in this vault, open the note instead.
+  linkNotionMentions(el, file) {
+    // Wiki links rendered inside the comment: open the note on click, like
+    // links in reading view (MarkdownRenderer output isn't wired up itself).
+    el.querySelectorAll("a.internal-link").forEach((a) => {
+      const dest = a.getAttribute("data-href") || a.getAttribute("href") || "";
+      if (!dest) return;
+      a.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        this.app.workspace.openLinkText(dest, file.path, obsidian.Keymap.isModEvent(ev));
+      }, true);
+      a.addEventListener("mouseover", (ev) => {
+        this.app.workspace.trigger("hover-link", { event: ev, source: "preview", hoverParent: el, targetEl: a, linktext: dest, sourcePath: file.path });
+      });
+    });
+    el.querySelectorAll("a[href]").forEach((a) => {
+      const href = a.getAttribute("href") || "";
+      const m = /notion\.(?:so|com)\/(?:[^?#]*?)([0-9a-f]{32})(?:[?#]|$)/i.exec(href.replace(/-/g, ""));
+      if (!m) return;
+      const target = this.notionIndex().get(m[1].toLowerCase());
+      if (!target) return;
+      a.removeClass("external-link");
+      a.addClass("internal-link");
+      a.setAttr("data-href", target.path);
+      a.setAttr("href", target.path);
+      a.removeAttribute("target");
+      a.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        this.app.workspace.openLinkText(target.path, file.path, obsidian.Keymap.isModEvent(ev));
+      }, true);
+    });
+  }
+
+  async deleteComment(file, thread, idx) {
+    await this.app.vault.process(file, (text) => {
+      const p = parseComments(text);
+      const t = p.threads.find((x) => x.lineStart === thread.lineStart && x.title === thread.title);
+      if (!t || !t.comments[idx]) return text;
+      const lines = p.lines;
+      if (t.comments.length === 1) {
+        let endLine = t.lineEnd;
+        while (endLine < lines.length && lines[endLine].trim() === "") endLine++;
+        lines.splice(t.lineStart, endLine - t.lineStart);
+      } else {
+        const c = t.comments[idx];
+        let s = c.lineStart;
+        // drop the blank ">" separator before this comment (or after, for the first one)
+        if (idx > 0 && /^>\s*$/.test(lines[s - 1])) s--;
+        let e = c.lineEnd;
+        if (idx === 0 && /^>\s*$/.test(lines[e] || "")) e++;
+        lines.splice(s, e - s);
+      }
+      return lines.join("\n");
+    });
+  }
+}
+
+// Live Preview: hide the raw comment callouts entirely (even when the cursor is
+// on them), so opening a note never flashes the unformatted text.
+function commentHiderExtension() {
+  let cmState, cmView;
+  try {
+    cmState = require("@codemirror/state");
+    cmView = require("@codemirror/view");
+  } catch (e) {
+    return [];
+  }
+  const { StateField } = cmState;
+  const { Decoration, EditorView } = cmView;
+  const isLive = (state) => {
+    try {
+      return obsidian.editorLivePreviewField ? !!state.field(obsidian.editorLivePreviewField, false) : true;
+    } catch (e) {
+      return true;
+    }
+  };
+  const build = (state) => {
+    if (!isLive(state)) return Decoration.none;
+    const doc = state.doc;
+    // only the top of the note matters; cap the text we parse
+    const head = doc.sliceString(0, Math.min(doc.length, 200000));
+    const p = parseComments(head);
+    if (!p.threads.length) return Decoration.none;
+    let last = p.end; // exclusive line index (0-based)
+    while (last < p.lines.length - 1 && p.lines[last].trim() === "") last++;
+    // last is now the first content line (or a trailing line); hide through the line before it
+    const fromLine = doc.line(p.start + 1);
+    const toLine = doc.line(Math.min(Math.max(last, p.start + 1), doc.lines));
+    if (toLine.to <= fromLine.from) return Decoration.none;
+    return Decoration.set([Decoration.replace({ block: true }).range(fromLine.from, toLine.to)]);
+  };
+  const field = StateField.define({
+    create: (state) => ({ live: isLive(state), deco: build(state) }),
+    update(value, tr) {
+      const live = isLive(tr.state);
+      if (!tr.docChanged && live === value.live) return value;
+      return { live, deco: build(tr.state) };
+    },
+    provide: (f) => [
+      EditorView.decorations.from(f, (v) => v.deco),
+      EditorView.atomicRanges.of((view) => view.state.field(f).deco),
+    ],
+  });
+  return [field];
+}
+
+class CommentSettingTab extends obsidian.PluginSettingTab {
+  constructor(app, plugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+
+  display() {
+    const { containerEl } = this;
+    containerEl.empty();
+    new obsidian.Setting(containerEl)
+      .setName("Comment author name")
+      .setDesc("Shown above comments you add with “Add a comment...”.")
+      .addText((t) =>
+        t.setPlaceholder("Your name").setValue(this.plugin.settings.commentAuthor || "").onChange(async (v) => {
+          this.plugin.settings.commentAuthor = v;
+          await this.plugin.saveData(this.plugin.settings);
+          this.plugin.comments.refreshSoon();
+        })
+      );
+  }
+}
+
 class NotionStyleKanbanPlugin extends obsidian.Plugin {
+  // ----- display titles -----
+
+  async setDisplayTitle(file, raw) {
+    const title = String(raw === undefined || raw === null ? "" : raw).replace(/\s+/g, " ").trim();
+    const fm = (this.app.metadataCache.getFileCache(file) || {}).frontmatter || {};
+    const had = Object.prototype.hasOwnProperty.call(fm, TITLE_KEY);
+    const oldLabels = [file.basename, titleOf(fm)].filter(Boolean);
+    if (!(had && titleOf(fm) === title)) {
+      await this.app.fileManager.processFrontMatter(file, (f) => { f[TITLE_KEY] = title; });
+    }
+    // relabel links first, while they still point at the current file name
+    await this.retitleLinks([{ file, title: title || file.basename, oldLabels }]);
+    // keep the file name close to the title, numbered only when another note already has it
+    if (title && !fileFitsTitle(file.basename, title)) {
+      const folder = file.parent ? file.parent.path : "";
+      try {
+        await this.app.fileManager.renameFile(file, uniqueNotePath(this.app, folder, safeFileName(title)));
+      } catch (e) {
+        console.warn("Notion-style Kanban: rename failed", e);
+      }
+    }
+  }
+
+  // Links whose label is the file name (or another old label) get the new title as their label.
+  // targets: [{ file, title, oldLabels? }]. Returns { links, sources } when dryRun.
+  async retitleLinks(targets, dryRun) {
+    const byPath = new Map(targets.map((t) => [t.file.path, t]));
+    const edits = new Map(); // source path -> [[original, replacement]]
+    let links = 0;
+    const resolved = this.app.metadataCache.resolvedLinks || {};
+    for (const src of Object.keys(resolved)) {
+      const dests = resolved[src];
+      if (!Object.keys(dests).some((d) => byPath.has(d))) continue;
+      const cache = this.app.metadataCache.getCache(src);
+      if (!cache) continue;
+      for (const l of [...(cache.frontmatterLinks || []), ...(cache.links || [])]) {
+        const dest = this.app.metadataCache.getFirstLinkpathDest(obsidian.getLinkpath(l.link), src);
+        const t = dest && byPath.get(dest.path);
+        if (!t) continue;
+        const label = l.displayText !== undefined ? l.displayText : "";
+        const linkName = obsidian.getLinkpath(l.link).split("/").pop();
+        const old = new Set([t.file.basename, linkName, ...(t.oldLabels || [])]);
+        const alias = linkAlias(t.title);
+        if (!old.has(label) || label === alias || !l.original.startsWith("[[")) continue;
+        const rep = `[[${l.link}|${alias}]]`;
+        if (!edits.has(src)) edits.set(src, []);
+        edits.get(src).push([l.original, rep]);
+        links++;
+      }
+    }
+    if (dryRun) return { links, sources: edits.size };
+    for (const [src, pairs] of edits) {
+      const f = this.app.vault.getFileByPath(src);
+      if (!f) continue;
+      await this.app.vault.process(f, (data) => {
+        // only touch the link text itself, in the frontmatter and the body alike
+        let out = data;
+        for (const [a, b] of pairs) out = out.split(a).join(b);
+        return out;
+      });
+    }
+    return { links, sources: edits.size };
+  }
+
+  async loadNotionTitles() {
+    const path = obsidian.normalizePath(`${this.manifest.dir}/notion-titles.json`);
+    if (!(await this.app.vault.adapter.exists(path))) return null;
+    try {
+      return JSON.parse(await this.app.vault.adapter.read(path));
+    } catch (e) {
+      new obsidian.Notice("notion-titles.json couldn't be read: " + e.message);
+      return null;
+    }
+  }
+
+  async planNotionTitles() {
+    const map = await this.loadNotionTitles();
+    if (!map) {
+      new obsidian.Notice("No Notion titles found. Put notion-titles.json in the plugin folder first.");
+      return null;
+    }
+    const norm = (id) => String(id || "").replace(/-/g, "").toLowerCase();
+    const titles = new Map(Object.entries(map).map(([k, v]) => [norm(k), String(v).replace(/\s+/g, " ").trim()]));
+    const notes = [];
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      const fm = (this.app.metadataCache.getFileCache(file) || {}).frontmatter;
+      if (!fm || !fm["notion-id"] || Object.prototype.hasOwnProperty.call(fm, TITLE_KEY)) continue;
+      const title = titles.get(norm(fm["notion-id"]));
+      if (!title || title === file.basename) continue;
+      notes.push({ file, title });
+    }
+    notes.sort((a, b) => a.file.path.localeCompare(b.file.path));
+    const counts = await this.retitleLinks(notes, true);
+    return { notes, links: counts.links, sources: counts.sources };
+  }
+
+  async applyNotionTitles(plan, fixLinks) {
+    const notice = new obsidian.Notice(`Setting titles on ${plan.notes.length} notes…`, 0);
+    let done = 0;
+    for (const n of plan.notes) {
+      await this.app.fileManager.processFrontMatter(n.file, (fm) => { fm[TITLE_KEY] = n.title; });
+      if (++done % 50 === 0) notice.setMessage(`Setting titles… ${done} of ${plan.notes.length}`);
+    }
+    let links = { links: 0, sources: 0 };
+    if (fixLinks) {
+      notice.setMessage("Updating link labels…");
+      links = await this.retitleLinks(plan.notes);
+    }
+    notice.hide();
+    new obsidian.Notice(`Titles set on ${done} notes` + (fixLinks ? `, ${links.links} links relabeled in ${links.sources} notes.` : "."));
+  }
+
   openOptions(file, prop, anchorEl) {
     if (this.activeOptions) this.activeOptions.close();
     this.activeOptions = new OptionsPopover(this, file, prop, anchorEl);
@@ -1927,6 +3748,7 @@ class NotionStyleKanbanPlugin extends obsidian.Plugin {
   }
 
   async onload() {
+    APP = this.app;
     this.settings = Object.assign({ recentIcons: [], savedIcons: [], pickerTab: null }, (await this.loadData()) || {});
     this.settings.recentIcons = this.settings.recentIcons.slice(0, RECENT_LIMIT);
     this.registerHoverLinkSource(HOVER_SOURCE, { display: "Notion-style Kanban", defaultMod: true });
@@ -1940,9 +3762,47 @@ class NotionStyleKanbanPlugin extends obsidian.Plugin {
     this.noteIcons.load();
     this.register(() => this.noteIcons.unload());
 
+    this.comments = new CommentsPanel(this);
+    this.comments.load();
+    this.register(() => this.comments.unload());
+    this.addSettingTab(new CommentSettingTab(this.app, this));
+    this.registerEditorExtension(commentHiderExtension());
+
     this.viewTabs = new ViewTabsBar(this);
     this.viewTabs.load();
     this.register(() => this.viewTabs.unload());
+
+    this.noteButtons = new NoteButtons(this);
+    this.noteButtons.load();
+
+    this.addCommand({
+      id: "apply-notion-titles",
+      name: "Use Notion page titles for imported notes",
+      callback: async () => {
+        const plan = await this.planNotionTitles();
+        if (!plan) return;
+        if (!plan.notes.length) return new obsidian.Notice("Every imported note already shows its Notion title.");
+        new NotionTitlesModal(this, plan).open();
+      },
+    });
+    this.addCommand({
+      id: "set-display-title",
+      name: "Edit title of current note",
+      checkCallback: (checking) => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file || file.extension !== "md") return false;
+        if (!checking) {
+          const fm = (this.app.metadataCache.getFileCache(file) || {}).frontmatter || {};
+          const go = async () => {
+            if (!Object.prototype.hasOwnProperty.call(fm, TITLE_KEY)) await this.setDisplayTitle(file, displayTitle(file));
+            this.focusTitlePath = file.path;
+            this.noteIcons.refreshSoon();
+          };
+          go();
+        }
+        return true;
+      },
+    });
 
     // "Change icon" on any note's right-click menu (cards, sub-tasks, file explorer, tabs)
     let lastMouse = null;

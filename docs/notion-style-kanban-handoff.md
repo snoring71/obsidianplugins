@@ -137,6 +137,10 @@ How Claude worked on it in the first chat:
 
 The Notion connector can fetch page icons, which `notion-fetch` returns as `icon="icons/<name>_<color>"`. Database queries don't include icons, and each page fetch is about 5k tokens, so copy icons only for the pages that need them.
 
+## Display titles (0.11.0)
+
+Notes can carry their real Notion title in a `title` property; the board, links, tabs and note header show it while file names stay unique. See [display-titles.md](display-titles.md).
+
 ## Known gaps and next steps
 
 Caveats:
