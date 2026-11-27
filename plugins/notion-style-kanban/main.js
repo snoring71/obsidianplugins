@@ -4416,7 +4416,8 @@ class CommentsPanel {
     const hosts = view.containerEl.querySelectorAll(".markdown-source-view .cm-sizer, .markdown-preview-view .markdown-preview-sizer");
     hosts.forEach((host) => {
       const header = host.querySelector(":scope > .mod-header") || host;
-      const meta = header.querySelector(":scope > .metadata-container");
+      // below the properties, and below the Sub-task / Related Notes sections when a note has them
+      const meta = header.querySelector(":scope > .nk-relations") || header.querySelector(":scope > .metadata-container");
       const before = meta ? meta.nextSibling : header.querySelector(":scope > .cm-contentContainer");
       let panel = header.querySelector(":scope > .nk-comments");
       if (!panel || (meta && panel.previousSibling !== meta)) {
@@ -4710,6 +4711,403 @@ function commentHiderExtension() {
   return [field];
 }
 
+// ---------- Notion-style relation sections (Sub-task, Related Notes) ----------
+//
+// Notion can show a relation property as its own section under the page's properties, one page
+// per line, with "Link existing" and "Add new". Each section here reads and writes a list
+// property of links, and keeps the other side of the two-way relation in step (Sub-task <->
+// Parent task, Related Notes <-> Task Board Item), since Obsidian doesn't do that on its own.
+
+const DEFAULT_RELATION_SECTIONS = [
+  {
+    property: "Sub-task", label: "Sub-task", icon: "corner-down-right", style: "tasks",
+    reverse: "Parent task", reverseSingle: true, base: "RM Tasks", onBase: "RM Tasks",
+    newMode: "inline", template: DEFAULT_SUBTASK_TEMPLATE,
+  },
+  {
+    property: "Related Notes", label: "Related Notes", icon: "database", style: "notes",
+    reverse: "Task Board Item", base: "Notes Database", onBase: "RM Tasks",
+    newMode: "menu",
+  },
+];
+
+function baseNameOf(fm) {
+  const l = parseLink(asString(asList(fm && fm.base)[0] || "")).linkpath;
+  return l ? l.split("/").pop().replace(/\.base$/, "") : "";
+}
+
+class RelationSections {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.app = plugin.app;
+    this.refreshSoon = obsidian.debounce(() => this.refreshAll(), 60, true);
+    this.adding = null; // { path, prop } while the inline "Add new" box is open
+  }
+
+  get enabled() {
+    return this.plugin.settings.relationSectionsOn !== false;
+  }
+
+  get sections() {
+    const custom = this.plugin.settings.relationSections;
+    return Array.isArray(custom) && custom.length ? custom : DEFAULT_RELATION_SECTIONS;
+  }
+
+  load() {
+    const p = this.plugin;
+    p.registerEvent(this.app.workspace.on("layout-change", () => this.refreshSoon()));
+    p.registerEvent(this.app.workspace.on("file-open", () => this.refreshSoon()));
+    p.registerEvent(this.app.workspace.on("active-leaf-change", () => this.refreshSoon()));
+    // a sub-task's status, tags, icon or title changing shows up here too
+    p.registerEvent(this.app.metadataCache.on("changed", () => this.refreshSoon()));
+    p.registerEvent(this.app.vault.on("rename", () => this.refreshSoon()));
+    p.registerEvent(this.app.workspace.on("nk:schema-changed", () => this.refreshSoon()));
+    this.observer = new MutationObserver(() => this.refreshSoon());
+    this.app.workspace.onLayoutReady(() => this.refreshAll());
+    // the sections replace these properties in the list, like Notion (right-click the icon to show them again)
+    const vis = this.plugin.settings.propertyVisibility || (this.plugin.settings.propertyVisibility = {});
+    if (this.enabled) for (const sec of this.sections) if (!vis[sec.property]) vis[sec.property] = "hide";
+  }
+
+  unload() {
+    if (this.observer) this.observer.disconnect();
+    document.querySelectorAll(".nk-relations").forEach((e) => e.remove());
+    document.querySelectorAll(".nk-link-list").forEach((e) => e.removeClass("nk-link-list"));
+  }
+
+  fm(file) {
+    const c = this.app.metadataCache.getFileCache(file);
+    return (c && c.frontmatter) || {};
+  }
+
+  // sections that apply to this note: it has the property, or it belongs to the section's base
+  sectionsFor(file) {
+    const fm = this.fm(file);
+    const base = baseNameOf(fm);
+    return this.sections.filter((s) => s && s.property && (Object.prototype.hasOwnProperty.call(fm, s.property) || (s.onBase && base === s.onBase)));
+  }
+
+  refreshAll() {
+    if (this.observer) this.observer.disconnect();
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const view = leaf.view;
+      if (!view || !view.file || !view.containerEl) continue;
+      this.renderInView(view);
+      this.markLinkLists(view);
+      if (this.observer) {
+        view.containerEl.querySelectorAll(".markdown-preview-sizer, .cm-sizer, .mod-header, .metadata-properties").forEach((h) => this.observer.observe(h, { childList: true }));
+      }
+    }
+  }
+
+  // relation properties (lists of links) show one page per line, like Notion
+  markLinkLists(view) {
+    const fm = this.fm(view.file);
+    view.containerEl.querySelectorAll(".metadata-property[data-property-key]").forEach((el) => {
+      const k = Object.keys(fm).find((x) => sameText(x, el.dataset.propertyKey));
+      const v = k ? fm[k] : undefined;
+      const isLinks = Array.isArray(v) && v.length > 0 && v.every((x) => typeof x === "string" && /^\[\[.*\]\]$/.test(x.trim()));
+      if (el.hasClass("nk-link-list") !== isLinks) el.toggleClass("nk-link-list", isLinks);
+    });
+  }
+
+  renderInView(view) {
+    const file = view.file;
+    const secs = this.enabled && file.extension === "md" ? this.sectionsFor(file) : [];
+    const hosts = view.containerEl.querySelectorAll(".markdown-source-view .cm-sizer, .markdown-preview-view .markdown-preview-sizer");
+    hosts.forEach((host) => {
+      const header = host.querySelector(":scope > .mod-header") || host;
+      let box = header.querySelector(":scope > .nk-relations");
+      if (!secs.length) { if (box) box.remove(); return; }
+      const meta = header.querySelector(":scope > .metadata-container");
+      if (!box) {
+        box = createDiv({ cls: "nk-relations" });
+        // keep the editor from taking clicks meant for the sections
+        for (const evt of ["mousedown", "pointerdown", "dragstart"]) box.addEventListener(evt, (e) => e.stopPropagation());
+        box.dataset.key = "";
+      }
+      // right under the properties, above the comments
+      if (meta) { if (box.previousSibling !== meta) meta.insertAdjacentElement("afterend", box); }
+      else if (!box.parentElement) header.insertBefore(box, header.querySelector(":scope > .cm-contentContainer") || header.querySelector(":scope > .nk-comments") || null);
+      if (box.querySelector(".nk-rel-new input") && box.contains(document.activeElement)) return;
+      const model = secs.map((s) => this.model(file, s));
+      const key = JSON.stringify([file.path, this.adding, model.map((m) => m.rows.map((r) => [r.path, r.name, r.icon, r.state, r.status, r.tags, r.colors]))]);
+      if (box.dataset.key === key) return;
+      box.dataset.key = key;
+      this.renderBox(box, file, model);
+    });
+  }
+
+  model(file, sec) {
+    const fm = this.fm(file);
+    const schemas = this.plugin.schemas;
+    const rows = [];
+    for (const raw of asList(fm[sec.property])) {
+      if (typeof raw !== "string") continue;
+      const { linkpath, alias } = parseLink(raw);
+      if (!linkpath) continue;
+      const f = this.app.metadataCache.getFirstLinkpathDest(linkpath, file.path);
+      const cfm = f ? this.fm(f) : {};
+      const row = {
+        raw, file: f, path: f ? f.path : linkpath,
+        name: f ? displayTitle(f, this.app) : alias || linkpath.split("/").pop(),
+        icon: f ? asString(cfm.icon) : "",
+      };
+      if (sec.style === "tasks") {
+        const statusKey = sec.statusProperty || "Status";
+        const tagKey = sec.tagProperty || "Tag";
+        row.status = asString(asList(cfm[statusKey])[0]);
+        row.tags = asList(cfm[tagKey]).map(asString).filter(Boolean);
+        row.state = DEFAULT_DONE_VALUES.some((d) => d.toLowerCase() === row.status.toLowerCase()) ? "done" : "open";
+        row.colors = [
+          schemas.colorOf(statusKey, row.status) || "",
+          ...row.tags.map((t) => schemas.colorOf(tagKey, t) || DEFAULT_TAG_COLORS.map((x) => x.split("=")).filter((x) => x[0].toLowerCase() === t.toLowerCase()).map((x) => x[1])[0] || hashColor(t.toLowerCase())),
+        ];
+      }
+      rows.push(row);
+    }
+    return { sec, rows };
+  }
+
+  renderBox(box, file, model) {
+    box.empty();
+    for (const { sec, rows } of model) {
+      const el = box.createDiv({ cls: `nk-rel nk-rel-${sec.style === "tasks" ? "tasks" : "notes"}` });
+      const head = el.createDiv({ cls: "nk-rel-head" });
+      setIconSafe(head.createSpan({ cls: "nk-rel-head-icon" }), [sec.icon || "arrow-up-right", "link"]);
+      head.createSpan({ text: sec.label || sec.property });
+      const list = el.createDiv({ cls: "nk-rel-list" });
+      for (const r of rows) this.renderRow(list, file, sec, r);
+
+      if (this.adding && this.adding.path === file.path && this.adding.prop === sec.property) this.renderNewInput(el, file, sec);
+
+      const foot = el.createDiv({ cls: "nk-rel-foot" });
+      const link = foot.createSpan({ cls: "nk-rel-action" });
+      setIconSafe(link.createSpan({ cls: "nk-rel-action-icon" }), ["arrow-up-right"]);
+      link.createSpan({ text: "Link existing" });
+      link.onclick = (ev) => { ev.preventDefault(); this.openLinkPicker(file, sec); };
+      const add = foot.createSpan({ cls: "nk-rel-action" });
+      setIconSafe(add.createSpan({ cls: "nk-rel-action-icon" }), ["plus"]);
+      add.createSpan({ text: "Add new" });
+      add.onclick = (ev) => { ev.preventDefault(); this.addNew(file, sec, add); };
+    }
+  }
+
+  renderRow(list, file, sec, r) {
+    const row = list.createDiv({ cls: "nk-rel-row" + (r.state === "done" ? " is-done" : "") });
+    const ic = row.createSpan({ cls: "nk-rel-icon" });
+    if (sec.style === "tasks") {
+      // the sub-task's own icon (e.g. the yellow "blocked" one from Notion), or a checkbox
+      if (r.state === "done") setIconSafe(ic, ["square-check", "check-square"]);
+      else if (!(r.icon && renderIconValue(ic, r.icon))) setIconSafe(ic, ["square"]);
+      ic.addClass("is-toggle");
+      ic.setAttr("aria-label", r.state === "done" ? "Mark not done" : "Mark done");
+      ic.onclick = (ev) => { ev.preventDefault(); ev.stopPropagation(); if (r.file) this.toggleDone(r.file, sec, r.state === "done"); };
+    } else if (!(r.icon && renderIconValue(ic, r.icon))) {
+      setIconSafe(ic, ["file-text", "file"]);
+    }
+    const body = row.createDiv({ cls: "nk-rel-body" });
+    const name = body.createSpan({ cls: "nk-rel-name" + (r.file ? "" : " is-unresolved"), text: r.name });
+    name.onclick = (ev) => {
+      ev.preventDefault();
+      this.app.workspace.openLinkText(r.file ? r.file.path : r.path, file.path, obsidian.Keymap.isModEvent(ev));
+    };
+    name.onmouseover = (ev) => {
+      this.app.workspace.trigger("hover-link", {
+        event: ev, source: HOVER_SOURCE, hoverParent: this, targetEl: name, linktext: r.file ? r.file.path : r.path, sourcePath: file.path,
+      });
+    };
+    if (sec.style === "tasks") {
+      if (r.status) renderOptionPill(body, r.status, r.colors[0] || "default", "nk-rel-status");
+      r.tags.forEach((t, i) => renderOptionPill(body, t, r.colors[i + 1] || "default", "nk-rel-tag"));
+    }
+    const more = row.createSpan({ cls: "nk-rel-more", attr: { "aria-label": "More" } });
+    setIconSafe(more, ["ellipsis", "more-horizontal"]);
+    const menu = (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const m = new obsidian.Menu();
+      m.addItem((i) => i.setTitle("Open in new tab").setIcon("file-plus").onClick(() => this.app.workspace.openLinkText(r.file ? r.file.path : r.path, file.path, "tab")));
+      m.addItem((i) => i.setTitle(`Remove from ${sec.label || sec.property}`).setIcon("x").onClick(() => this.unlink(file, sec, r)));
+      if (r.file) {
+        m.addSeparator();
+        this.app.workspace.trigger("file-menu", m, r.file, HOVER_SOURCE);
+      }
+      if (ev instanceof MouseEvent && ev.clientX) m.showAtMouseEvent(ev);
+      else { const b = more.getBoundingClientRect(); m.showAtPosition({ x: b.left, y: b.bottom + 4 }); }
+    };
+    more.onclick = menu;
+    row.oncontextmenu = menu;
+  }
+
+  renderNewInput(el, file, sec) {
+    const wrap = el.createDiv({ cls: "nk-rel-row nk-rel-new" });
+    setIconSafe(wrap.createSpan({ cls: "nk-rel-icon" }), sec.style === "tasks" ? ["square"] : ["file-text"]);
+    const input = wrap.createEl("input", { type: "text", attr: { placeholder: "Type a name, then Enter" } });
+    let done = false;
+    const finish = async (save) => {
+      if (done) return;
+      done = true;
+      const title = input.value.replace(/\s+/g, " ").trim();
+      this.adding = null;
+      if (save && title) await this.createLinked(file, sec, title, null);
+      this.refreshAll();
+    };
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" && !ev.isComposing) { ev.preventDefault(); finish(true); }
+      else if (ev.key === "Escape") { ev.preventDefault(); finish(false); }
+    });
+    input.addEventListener("blur", () => window.setTimeout(() => finish(true), 0));
+    window.setTimeout(() => input.focus(), 0);
+  }
+
+  // ----- writing -----
+
+  linkTo(file) {
+    return `[[${file.path.replace(/\.md$/, "")}|${linkAlias(displayTitle(file, this.app))}]]`;
+  }
+
+  async addLink(file, sec, target) {
+    const nb = this.plugin.noteButtons;
+    if (target.path === file.path) return;
+    await this.app.fileManager.processFrontMatter(file, (fm) => { fm[sec.property] = nb.withLink(fm[sec.property], target, file); });
+    if (!sec.reverse) return;
+    // a sub-task has one parent: moving it here takes it off the old parent's list
+    const old = sec.reverseSingle ? nb.linkedFiles(this.fm(target)[sec.reverse], target).filter((p) => p.path !== file.path) : [];
+    await this.app.fileManager.processFrontMatter(target, (fm) => {
+      fm[sec.reverse] = sec.reverseSingle ? [this.linkTo(file)] : nb.withLink(fm[sec.reverse], file, target);
+    });
+    for (const op of old) {
+      await this.app.fileManager.processFrontMatter(op, (fm) => { fm[sec.property] = nb.withoutLink(fm[sec.property], target, op); });
+    }
+  }
+
+  async unlink(file, sec, r) {
+    const nb = this.plugin.noteButtons;
+    await this.app.fileManager.processFrontMatter(file, (fm) => {
+      fm[sec.property] = r.file ? nb.withoutLink(fm[sec.property], r.file, file) : asList(fm[sec.property]).filter((x) => x !== r.raw);
+    });
+    if (r.file && sec.reverse) {
+      await this.app.fileManager.processFrontMatter(r.file, (fm) => { fm[sec.reverse] = nb.withoutLink(fm[sec.reverse], file, r.file); });
+    }
+  }
+
+  async toggleDone(file, sec, isDone) {
+    const key = sec.statusProperty || "Status";
+    const target = isDone ? (sec.undoneValue || "Not started") : (sec.doneValue || "Done");
+    await this.app.fileManager.processFrontMatter(file, (fm) => { fm[key] = Array.isArray(fm[key]) ? [target] : target; });
+  }
+
+  baseFile(name) {
+    if (!name) return null;
+    return this.app.vault.getFiles().find((f) => f.extension === "base" && f.basename === name) || null;
+  }
+
+  // new note in the section's database, linked both ways; tpl is a template entry or null
+  async createLinked(file, sec, title, tpl, open) {
+    try {
+      let note;
+      if (sec.style === "tasks" && sec.reverse) {
+        const cfg = Object.assign({}, BUTTON_DEFAULTS, { parentProperty: sec.reverse, subtaskProperty: sec.property });
+        note = await this.plugin.noteButtons.createNote(cfg, { name: title, template: sec.template !== undefined ? sec.template : DEFAULT_SUBTASK_TEMPLATE }, file, true);
+      } else {
+        const lib = this.plugin.templates;
+        const base = this.baseFile(sec.base);
+        const db = base ? lib.dbForBase(base) : { notesFolder: file.parent ? file.parent.path : "", baseLink: asString(this.fm(file).base) || "" };
+        const opts = { open: open ? "tab" : "none" };
+        if (title !== null && title !== undefined) opts.title = title;
+        if (sec.reverse) opts.properties = { [sec.reverse]: [this.linkTo(file)] };
+        note = await lib.create(db, tpl, opts);
+        if (!db.baseLink) await this.app.fileManager.processFrontMatter(note, (fm) => { if (!fm.base) delete fm.base; });
+        await this.app.fileManager.processFrontMatter(file, (fm) => { fm[sec.property] = this.plugin.noteButtons.withLink(fm[sec.property], note, file); });
+      }
+      return note;
+    } catch (e) {
+      console.error("[notion-style-kanban] relation add", e);
+      new obsidian.Notice("Couldn't add the page: " + (e && e.message ? e.message : e));
+      return null;
+    }
+  }
+
+  addNew(file, sec, anchor) {
+    const lib = this.plugin.templates;
+    const base = this.baseFile(sec.base);
+    const db = base ? lib.dbForBase(base) : null;
+    const tpls = sec.newMode === "menu" && db ? lib.templates(db) : [];
+    if (!tpls.length) {
+      this.adding = { path: file.path, prop: sec.property };
+      this.refreshAll();
+      return;
+    }
+    // Notion: "Add new" in a relation to a database with templates offers them
+    const m = new obsidian.Menu();
+    for (const t of tpls) {
+      m.addItem((i) => {
+        i.setTitle(t.name + (t.isDefault ? "  (default)" : "")).setIcon("file-text").onClick(() => this.createLinked(file, sec, undefined, t, true));
+        const ic = lib.templateIcon(t);
+        if (ic && i.iconEl) { i.iconEl.empty(); if (!renderIconValue(i.iconEl, ic)) setIconSafe(i.iconEl, ["file-text"]); }
+      });
+    }
+    m.addSeparator();
+    m.addItem((i) => i.setTitle("Empty page").setIcon("file").onClick(() => {
+      this.adding = { path: file.path, prop: sec.property };
+      this.refreshAll();
+    }));
+    const r = anchor.getBoundingClientRect();
+    m.showAtPosition({ x: r.left, y: r.bottom + 4 });
+  }
+
+  openLinkPicker(file, sec) {
+    const already = new Set(this.plugin.noteButtons.linkedFiles(this.fm(file)[sec.property], file).map((f) => f.path));
+    const files = this.app.vault.getMarkdownFiles().filter((f) => {
+      if (f.path === file.path || already.has(f.path)) return false;
+      if (f.path.startsWith(this.plugin.templates.root + "/")) return false;
+      return !sec.base || baseNameOf(this.fm(f)) === sec.base;
+    });
+    new RelationLinkModal(this.app, files, sec, (target) => this.addLink(file, sec, target)).open();
+  }
+}
+
+// "Link existing": every word you type has to appear in the title, in any order; best matches
+// first, then the most recently changed.
+class RelationLinkModal extends obsidian.SuggestModal {
+  constructor(app, files, sec, onPick) {
+    super(app);
+    this.items = files.map((f) => ({ file: f, title: displayTitle(f, app), lower: displayTitle(f, app).toLowerCase() }));
+    this.onPick = onPick;
+    this.limit = 60;
+    this.setPlaceholder(`Link a page to ${sec.label || sec.property}…`);
+  }
+
+  getSuggestions(query) {
+    const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+    const out = [];
+    for (const it of this.items) {
+      let score = 0;
+      let ok = true;
+      for (const w of words) {
+        const i = it.lower.indexOf(w);
+        if (i < 0) { ok = false; break; }
+        // whole-word and early matches rank higher
+        score += (i === 0 || /[\s\-_/(]/.test(it.lower[i - 1]) ? 2 : 1) + (i < 20 ? 1 : 0);
+      }
+      if (ok) out.push({ it, score });
+    }
+    out.sort((a, b) => b.score - a.score || b.it.file.stat.mtime - a.it.file.stat.mtime);
+    return out.slice(0, this.limit).map((x) => x.it);
+  }
+
+  renderSuggestion(it, el) {
+    el.addClass("nk-rel-suggest");
+    el.createDiv({ text: it.title });
+    el.createDiv({ cls: "nk-rel-suggest-path", text: it.file.parent ? it.file.parent.path : "" });
+  }
+
+  onChooseSuggestion(it) {
+    this.onPick(it.file);
+  }
+}
+
 class CommentSettingTab extends obsidian.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
@@ -4727,6 +5125,18 @@ class CommentSettingTab extends obsidian.PluginSettingTab {
           this.plugin.settings.commentAuthor = v;
           await this.plugin.saveData(this.plugin.settings);
           this.plugin.comments.refreshSoon();
+        })
+      );
+
+    new obsidian.Setting(containerEl).setName("Relation sections").setHeading();
+    new obsidian.Setting(containerEl)
+      .setName("Show Sub-task and Related Notes as sections")
+      .setDesc("Under the properties of RM Tasks notes, one page per line, with Link existing and Add new, like Notion.")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.relationSectionsOn !== false).onChange(async (v) => {
+          this.plugin.settings.relationSectionsOn = v;
+          await this.plugin.saveData(this.plugin.settings);
+          this.plugin.relations.refreshAll();
         })
       );
 
@@ -4914,6 +5324,10 @@ class NotionStyleKanbanPlugin extends obsidian.Plugin {
     this.register(() => this.comments.unload());
     this.addSettingTab(new CommentSettingTab(this.app, this));
     this.registerEditorExtension(commentHiderExtension());
+
+    this.relations = new RelationSections(this);
+    this.relations.load();
+    this.register(() => this.relations.unload());
 
     this.viewTabs = new ViewTabsBar(this);
     this.viewTabs.load();

@@ -141,6 +141,12 @@ The Notion connector can fetch page icons, which `notion-fetch` returns as `icon
 
 Notes can carry their real Notion title in a `title` property; the board, links, tabs and note header show it while file names stay unique. See [display-titles.md](display-titles.md).
 
+## Relation sections (0.18.0)
+
+`RelationSections` draws Notion-style sections under the properties of RM Tasks notes, above the comments: **Sub-task** (checkbox or the task's own icon, status pill, tag pills) and **Related Notes** (note icon and title), one page per line, with **Link existing** and **Add new**. Both keep the other side of the relation in step: Sub-task <-> Parent task (a sub-task has one parent, so linking it here takes it off its old parent) and Related Notes <-> Task Board Item. Add new on Sub-task types a name inline and uses `Templates/RM Tasks/RM Sub-task.md`; on Related Notes it offers the Notes Database templates. Clicking a sub-task's icon toggles Done / Not started. The ⋯ button (or right-click / long-press) has Remove. The two properties are hidden from the properties list by default (right-click a property icon to show them). Sections are configurable in `data.json` as `relationSections` (see `DEFAULT_RELATION_SECTIONS`) and can be turned off in settings.
+
+Any property holding a list of links (Completed Tasks, Parent task, Blocked by…) shows one page per line in the properties list.
+
 ## Known gaps and next steps
 
 Caveats:
