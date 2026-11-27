@@ -4,6 +4,7 @@ Task Board Item: []
 Related: []
 Topic: RM Sprint Review
 icon: "icons/document_brown"
+Date: "{{now:YYYY-MM-DDTHH:mm}}"
 Created: "{{now}}"
 title: "RM Sprint Review"
 ---

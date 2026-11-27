@@ -4,6 +4,7 @@ Task Board Item: []
 Related: []
 Topic: Production Meeting
 icon: "icons/document_gray"
+Date: "{{now:YYYY-MM-DDTHH:mm}}"
 Created: "{{now}}"
 title: "Production Meeting"
 ---

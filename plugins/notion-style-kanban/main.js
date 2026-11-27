@@ -374,6 +374,7 @@ class NotionKanbanView extends obsidian.BasesView {
     const scrollTop = this.rootEl.scrollTop;
     const s = this.settings();
     this.s = s;
+    this.scope = this.plugin.schemas.scopeOf(this.boardBaseFile()); // the database, for its own option lists
     if (this.collapsedLanes === null) this.collapsedLanes = new Set(asList(this.cfg("collapsedLanes", [])).map(String));
     const { columns, lanes, buckets } = this.collect(s);
     this.childPaths = new Set();
@@ -387,7 +388,7 @@ class NotionKanbanView extends obsidian.BasesView {
     // column headers
     const header = board.createDiv({ cls: "nk-row nk-header-row" });
     columns.forEach((col, ci) => {
-      const rgb = rgbFor(this.plugin.schemas.colorOf(s.columnKey, col) || s.columnColors.get(col.toLowerCase()) || "gray");
+      const rgb = rgbFor(this.plugin.schemas.colorOf(s.columnKey, col, this.scope) || s.columnColors.get(col.toLowerCase()) || "gray");
       const h = header.createDiv({ cls: "nk-col-header" });
       h.style.setProperty("--nk-rgb", rgb);
       const pill = h.createSpan({ cls: "nk-status-pill" });
@@ -408,7 +409,7 @@ class NotionKanbanView extends obsidian.BasesView {
         const caret = lh.createSpan({ cls: "nk-caret" });
         setIconSafe(caret, ["chevron-down"]);
         const lanePill = lh.createSpan({ cls: "nk-lane-pill", text: lane });
-        lanePill.style.setProperty("--nk-rgb", rgbFor((s.laneKey && this.plugin.schemas.colorOf(s.laneKey, lane)) || s.laneColors.get(lane.toLowerCase()) || s.tagColors.get(lane.toLowerCase()) || "blue"));
+        lanePill.style.setProperty("--nk-rgb", rgbFor((s.laneKey && this.plugin.schemas.colorOf(s.laneKey, lane, this.scope)) || s.laneColors.get(lane.toLowerCase()) || s.tagColors.get(lane.toLowerCase()) || "blue"));
         let n = 0;
         columns.forEach((_, ci) => (n += (buckets.get(`${lane}\u0000${ci}`) || []).length));
         lh.createSpan({ cls: "nk-count", text: String(n) });
@@ -417,7 +418,7 @@ class NotionKanbanView extends obsidian.BasesView {
       }
       const row = board.createDiv({ cls: "nk-row" });
       columns.forEach((col, ci) => {
-        const rgb = rgbFor(this.plugin.schemas.colorOf(s.columnKey, col) || s.columnColors.get(col.toLowerCase()) || "gray");
+        const rgb = rgbFor(this.plugin.schemas.colorOf(s.columnKey, col, this.scope) || s.columnColors.get(col.toLowerCase()) || "gray");
         const cell = row.createDiv({ cls: "nk-cell" });
         cell.style.setProperty("--nk-rgb", rgb);
         const list = buckets.get(`${lane}\u0000${ci}`) || [];
@@ -464,7 +465,7 @@ class NotionKanbanView extends obsidian.BasesView {
       const tagRow = card.createDiv({ cls: "nk-tags" });
       for (const t of tags) {
         const p = tagRow.createSpan({ cls: "nk-tag", text: t });
-        p.style.setProperty("--nk-rgb", rgbFor(this.plugin.schemas.colorOf(s.tagKey, t) || s.tagColors.get(t.toLowerCase()) || hashColor(t.toLowerCase())));
+        p.style.setProperty("--nk-rgb", rgbFor(this.plugin.schemas.colorOf(s.tagKey, t, c.file) || s.tagColors.get(t.toLowerCase()) || hashColor(t.toLowerCase())));
       }
     }
 
@@ -1274,6 +1275,11 @@ function sameText(a, b) {
 // Option lists, colors and icons for properties, shared by every note and board in the vault.
 // Stored in data.json as settings.properties = { Tag: { type: "multi", options: [{ name, color }] } }
 // and settings.propertyIcons = { Tag: "tag:gray" }.
+// Like Notion, a database can have its own option list for a property (Notes Database's Status
+// is Needs work / Future / Closed, RM Tasks' is Not started / In progress / ...). Those live in
+// settings.databaseProperties = { "Notes Database": { Status: { type, options } } } and win over
+// the shared list for notes in that database. A "scope" is a database name, or a note / .base
+// file to work it out from (the note's base property, or its Templates/<database>/ folder).
 class PropertySchemas {
   constructor(plugin) {
     this.plugin = plugin;
@@ -1286,36 +1292,114 @@ class PropertySchemas {
     return s.properties;
   }
 
+  get scoped() {
+    const s = this.plugin.settings;
+    if (!s.databaseProperties || typeof s.databaseProperties !== "object") s.databaseProperties = {};
+    return s.databaseProperties;
+  }
+
   get icons() {
     const s = this.plugin.settings;
     if (!s.propertyIcons || typeof s.propertyIcons !== "object") s.propertyIcons = {};
     return s.propertyIcons;
   }
 
-  keyOf(name) {
-    if (!name) return null;
-    if (this.all[name]) return name;
-    return Object.keys(this.all).find((k) => sameText(k, name)) || null;
+  // database name for a note, a .base file or a name
+  scopeOf(x) {
+    if (!x) return null;
+    if (typeof x === "string") return x;
+    if (!(x instanceof obsidian.TFile)) return null;
+    if (x.extension === "base") return x.basename;
+    const fm = (this.app.metadataCache.getFileCache(x) || {}).frontmatter;
+    const link = fm && fm.base ? parseLink(asString(fm.base)).linkpath : "";
+    if (link) return link.split("/").pop().replace(/\.base$/i, "");
+    const root = obsidian.normalizePath(this.plugin.settings.templatesFolder || TEMPLATES_ROOT);
+    const parts = x.path.split("/");
+    if (parts.length >= 3 && parts.slice(0, -2).join("/") === root) return parts[parts.length - 2];
+    return null;
   }
 
-  find(name) {
-    const k = this.keyOf(name);
-    return k ? this.all[k] : null;
+  ownKey(table, name) {
+    if (!table || !name) return null;
+    if (table[name]) return name;
+    return Object.keys(table).find((k) => sameText(k, name)) || null;
   }
 
-  isManaged(name) {
-    const p = this.find(name);
+  // the database's own option lists, if it has any
+  tableFor(scope) {
+    const db = this.scopeOf(scope);
+    if (!db) return null;
+    const k = this.ownKey(this.scoped, db);
+    return k ? this.scoped[k] : null;
+  }
+
+  // true when this database has its own option list for prop
+  hasOwn(prop, scope) {
+    return !!this.ownKey(this.tableFor(scope), prop);
+  }
+
+  // [table, key] that holds prop's options for this scope (the database's own list, else the shared one)
+  locate(name, scope) {
+    if (!name) return [this.all, null];
+    const t = this.tableFor(scope);
+    const own = this.ownKey(t, name);
+    if (own) return [t, own];
+    return [this.all, this.ownKey(this.all, name)];
+  }
+
+  keyOf(name, scope) {
+    return this.locate(name, scope)[1];
+  }
+
+  find(name, scope) {
+    const [t, k] = this.locate(name, scope);
+    return k ? t[k] : null;
+  }
+
+  isManaged(name, scope) {
+    const p = this.find(name, scope);
     return !!(p && (p.type === "select" || p.type === "multi"));
   }
 
-  option(prop, value) {
-    const p = this.find(prop);
+  option(prop, value, scope) {
+    const p = this.find(prop, scope);
     return p && Array.isArray(p.options) ? p.options.find((o) => sameText(o.name, value)) || null : null;
   }
 
-  colorOf(prop, value) {
-    const o = prop ? this.option(prop, value) : null;
+  colorOf(prop, value, scope) {
+    const o = prop ? this.option(prop, value, scope) : null;
     return o ? o.color || "default" : null;
+  }
+
+  // Give a database its own option list for prop, starting from the shared list (or the values its notes use).
+  async separate(prop, scope) {
+    const db = this.scopeOf(scope);
+    if (!db || this.hasOwn(prop, db)) return;
+    const dbKey = this.ownKey(this.scoped, db) || db;
+    if (!this.scoped[dbKey]) this.scoped[dbKey] = {};
+    const shared = this.find(prop, null);
+    const used = new Set();
+    for (const n of this.notesIn(prop, db)) for (const v of n.values) used.add(v.toLowerCase());
+    let options;
+    if (shared) {
+      options = (shared.options || []).filter((o) => used.has(o.name.toLowerCase())).map((o) => ({ ...o }));
+      for (const v of this.valuesInVault(prop, db)) if (!options.some((o) => sameText(o.name, v))) options.push({ name: v, color: "default" });
+    } else {
+      options = this.valuesInVault(prop, db).map((v, i) => ({ name: v, color: OPTION_COLORS[(i % 9) + 1] }));
+    }
+    this.scoped[dbKey][this.ownKey(this.all, prop) || prop] = { type: shared ? shared.type : "select", options };
+    await this.save();
+  }
+
+  // Go back to the shared option list for prop in this database.
+  async rejoin(prop, scope) {
+    const t = this.tableFor(scope);
+    const k = this.ownKey(t, prop);
+    if (!k) return;
+    delete t[k];
+    const db = this.ownKey(this.scoped, this.scopeOf(scope));
+    if (db && !Object.keys(this.scoped[db]).length) delete this.scoped[db];
+    await this.save();
   }
 
   get visibility() {
@@ -1353,26 +1437,28 @@ class PropertySchemas {
   }
 
   // Turn a property into a select / multi-select, seeding options from values already in the vault.
-  async manage(prop, type) {
-    const k = this.keyOf(prop) || prop;
-    const existing = this.all[k];
+  async manage(prop, type, scope) {
+    const [t, k0] = this.locate(prop, scope);
+    const k = k0 || prop;
+    const existing = t[k];
     if (existing) existing.type = type;
     else {
       const options = [];
       for (const v of this.valuesInVault(prop)) options.push({ name: v, color: OPTION_COLORS[(options.length % 9) + 1] });
-      this.all[k] = { type, options };
+      t[k] = { type, options };
     }
     await this.save();
   }
 
-  async unmanage(prop) {
+  async unmanage(prop, scope) {
+    if (this.hasOwn(prop, scope)) return this.rejoin(prop, scope);
     const k = this.keyOf(prop);
     if (k) delete this.all[k];
     await this.save();
   }
 
-  addOption(prop, name, color) {
-    const p = this.find(prop);
+  addOption(prop, name, color, scope) {
+    const p = this.find(prop, scope);
     if (!p) return null;
     if (!Array.isArray(p.options)) p.options = [];
     let o = p.options.find((x) => sameText(x.name, name));
@@ -1395,29 +1481,44 @@ class PropertySchemas {
     return Object.keys(fm).find((k) => sameText(k, prop)) || null;
   }
 
-  *notesWith(prop) {
+  // Notes that use prop's option list for this scope: the database's own notes when it has its
+  // own list, otherwise every note except those in databases with their own list.
+  *notesWith(prop, scope) {
+    const own = this.hasOwn(prop, scope) ? this.scopeOf(scope) : null;
     for (const file of this.app.vault.getMarkdownFiles()) {
+      const fm = (this.app.metadataCache.getFileCache(file) || {}).frontmatter;
+      const k = this.fmKey(fm, prop);
+      if (!k) continue;
+      if (own ? !sameText(this.scopeOf(file) || "", own) : this.hasOwn(prop, file)) continue;
+      yield { file, key: k, values: asList(fm[k]).map(asString).filter(Boolean) };
+    }
+  }
+
+  // notes in one database that have prop
+  *notesIn(prop, db) {
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      if (!sameText(this.scopeOf(file) || "", db)) continue;
       const fm = (this.app.metadataCache.getFileCache(file) || {}).frontmatter;
       const k = this.fmKey(fm, prop);
       if (k) yield { file, key: k, values: asList(fm[k]).map(asString).filter(Boolean) };
     }
   }
 
-  valuesInVault(prop) {
+  valuesInVault(prop, db) {
     const seen = new Map();
-    for (const n of this.notesWith(prop)) for (const v of n.values) if (!seen.has(v.toLowerCase())) seen.set(v.toLowerCase(), v);
+    for (const n of db ? this.notesIn(prop, db) : this.notesWith(prop)) for (const v of n.values) if (!seen.has(v.toLowerCase())) seen.set(v.toLowerCase(), v);
     return [...seen.values()].sort((a, b) => a.localeCompare(b));
   }
 
-  usage(prop, name) {
+  usage(prop, name, scope) {
     let n = 0;
-    for (const x of this.notesWith(prop)) if (x.values.some((v) => sameText(v, name))) n++;
+    for (const x of this.notesWith(prop, scope)) if (x.values.some((v) => sameText(v, name))) n++;
     return n;
   }
 
   // Rename (newName) or remove (newName === null) a value on every note that has it.
-  async rewriteValue(prop, oldName, newName) {
-    const targets = [...this.notesWith(prop)].filter((x) => x.values.some((v) => sameText(v, oldName)));
+  async rewriteValue(prop, oldName, newName, scope) {
+    const targets = [...this.notesWith(prop, scope)].filter((x) => x.values.some((v) => sameText(v, oldName)));
     for (const t of targets) {
       await this.app.fileManager.processFrontMatter(t.file, (fm) => {
         const k = this.fmKey(fm, prop);
@@ -1439,24 +1540,24 @@ class PropertySchemas {
     return targets.length;
   }
 
-  async renameOption(prop, oldName, newName) {
+  async renameOption(prop, oldName, newName, scope) {
     newName = String(newName).trim();
-    const o = this.option(prop, oldName);
+    const o = this.option(prop, oldName, scope);
     if (!o || !newName || newName === o.name) return 0;
-    const dup = this.option(prop, newName);
-    const p = this.find(prop);
+    const dup = this.option(prop, newName, scope);
+    const p = this.find(prop, scope);
     if (dup && dup !== o) p.options = p.options.filter((x) => x !== o); // merging into an existing option
     else o.name = newName;
     await this.save();
-    return this.rewriteValue(prop, oldName, dup && dup !== o ? dup.name : newName);
+    return this.rewriteValue(prop, oldName, dup && dup !== o ? dup.name : newName, scope);
   }
 
-  async deleteOption(prop, name) {
-    const p = this.find(prop);
+  async deleteOption(prop, name, scope) {
+    const p = this.find(prop, scope);
     if (!p) return 0;
     p.options = (p.options || []).filter((o) => !sameText(o.name, name));
     await this.save();
-    return this.rewriteValue(prop, name, null);
+    return this.rewriteValue(prop, name, null, scope);
   }
 }
 
@@ -1500,7 +1601,7 @@ class OptionsPopover {
     this.menu = null;
   }
 
-  get schema() { return this.schemas.find(this.prop) || { type: "multi", options: [] }; }
+  get schema() { return this.schemas.find(this.prop, this.file) || { type: "multi", options: [] }; }
   get multi() { return this.schema.type === "multi"; }
 
   readValues() {
@@ -1576,7 +1677,7 @@ class OptionsPopover {
 
   render() {
     if (!this.el) return;
-    const colorOf = (v) => this.schemas.colorOf(this.prop, v) || "default";
+    const colorOf = (v) => this.schemas.colorOf(this.prop, v, this.file) || "default";
 
     // selected values + search box
     const hadFocus = this.input && document.activeElement === this.input;
@@ -1654,7 +1755,7 @@ class OptionsPopover {
   async choose(row) {
     let name;
     if (row.kind === "create") {
-      const o = this.schemas.addOption(this.prop, row.name.trim());
+      const o = this.schemas.addOption(this.prop, row.name.trim(), undefined, this.file);
       await this.schemas.save();
       name = o.name;
     } else name = row.option.name;
@@ -1696,7 +1797,7 @@ class OptionsPopover {
       const next = input.value.trim();
       if (!next || next === option.name) return;
       const old = option.name;
-      const n = await this.schemas.renameOption(this.prop, old, next);
+      const n = await this.schemas.renameOption(this.prop, old, next, this.file);
       this.values = this.values.map((v) => (sameText(v, old) ? next : v));
       if (n) new obsidian.Notice(`Renamed "${old}" to "${next}" on ${n} note${n === 1 ? "" : "s"}.`);
       this.render();
@@ -1708,10 +1809,10 @@ class OptionsPopover {
     setIconSafe(del.createSpan({ cls: "nk-options-menu-icon" }), ["trash-2", "trash"]);
     del.createSpan({ text: "Delete" });
     del.onclick = () => {
-      const n = this.schemas.usage(this.prop, option.name);
+      const n = this.schemas.usage(this.prop, option.name, this.file);
       this.closeMenu();
       const run = async () => {
-        const changed = await this.schemas.deleteOption(this.prop, option.name);
+        const changed = await this.schemas.deleteOption(this.prop, option.name, this.file);
         this.values = this.values.filter((v) => !sameText(v, option.name));
         if (changed) new obsidian.Notice(`Removed "${option.name}" from ${changed} note${changed === 1 ? "" : "s"}.`);
         this.render();
@@ -1783,7 +1884,7 @@ class PropertyPanel {
       if (!propEl) return;
       ev.preventDefault();
       ev.stopPropagation();
-      this.propertyMenu(propEl.dataset.propertyKey, iconEl, ev);
+      this.propertyMenu(propEl.dataset.propertyKey, iconEl, ev, this.fileOfEl(propEl));
     }, true);
     this.app.workspace.onLayoutReady(() => this.refreshAll());
   }
@@ -1796,7 +1897,16 @@ class PropertyPanel {
     document.querySelectorAll(".nk-managed, .nk-has-icon").forEach((e) => e.removeClass("nk-managed", "nk-has-icon"));
   }
 
-  propertyMenu(prop, iconEl, ev) {
+  // the note whose properties panel holds el
+  fileOfEl(el) {
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const v = leaf.view;
+      if (v && v.file && v.containerEl && v.containerEl.contains(el)) return v.file;
+    }
+    return null;
+  }
+
+  propertyMenu(prop, iconEl, ev, file) {
     const menu = new obsidian.Menu();
     menu.addItem((i) => i.setTitle("Change icon").setIcon("smile-plus").onClick(() => this.pickIcon(prop, iconEl)));
     if (this.schemas.iconOf(prop)) menu.addItem((i) => i.setTitle("Remove icon").setIcon("x").onClick(() => this.schemas.setIcon(prop, null)));
@@ -1806,11 +1916,16 @@ class PropertyPanel {
       menu.addItem((i) => i.setTitle(title).setIcon(icon).setChecked(vis === mode).onClick(() => this.schemas.setVisibility(prop, mode)));
     }
     menu.addSeparator();
-    const cur = this.schemas.find(prop);
+    const cur = this.schemas.find(prop, file);
     const kind = cur ? cur.type : "";
-    menu.addItem((i) => i.setTitle("Notion-style select").setChecked(kind === "select").onClick(() => this.schemas.manage(prop, "select")));
-    menu.addItem((i) => i.setTitle("Notion-style multi-select").setChecked(kind === "multi").onClick(() => this.schemas.manage(prop, "multi")));
-    if (cur) menu.addItem((i) => i.setTitle("Plain Obsidian property").setChecked(false).onClick(() => this.schemas.unmanage(prop)));
+    menu.addItem((i) => i.setTitle("Notion-style select").setChecked(kind === "select").onClick(() => this.schemas.manage(prop, "select", file)));
+    menu.addItem((i) => i.setTitle("Notion-style multi-select").setChecked(kind === "multi").onClick(() => this.schemas.manage(prop, "multi", file)));
+    const db = this.schemas.scopeOf(file);
+    if (cur && db) {
+      const own = this.schemas.hasOwn(prop, db);
+      menu.addItem((i) => i.setTitle(`Separate options for ${db}`).setIcon("split").setChecked(own).onClick(() => (own ? this.schemas.rejoin(prop, db) : this.schemas.separate(prop, db))));
+    }
+    if (cur) menu.addItem((i) => i.setTitle("Plain Obsidian property").setChecked(false).onClick(() => this.schemas.unmanage(prop, file)));
     menu.showAtMouseEvent(ev);
   }
 
@@ -1902,7 +2017,7 @@ class PropertyPanel {
     const valueEl = propEl.querySelector(".metadata-property-value");
     if (!valueEl) return;
     let box = valueEl.querySelector(":scope > .nk-select-value");
-    if (!this.schemas.isManaged(prop)) {
+    if (!this.schemas.isManaged(prop, file)) {
       if (box) box.remove();
       if (propEl.hasClass("nk-managed")) propEl.removeClass("nk-managed");
       return;
@@ -1910,7 +2025,7 @@ class PropertyPanel {
     const fm = (this.app.metadataCache.getFileCache(file) || {}).frontmatter || {};
     const k = this.schemas.fmKey(fm, prop);
     const values = k ? asList(fm[k]).map(asString).filter(Boolean) : [];
-    const sig = JSON.stringify([file.path, values, values.map((v) => this.schemas.colorOf(prop, v))]);
+    const sig = JSON.stringify([file.path, values, values.map((v) => this.schemas.colorOf(prop, v, file))]);
     if (!propEl.hasClass("nk-managed")) propEl.addClass("nk-managed");
     if (box && box.dataset.sig === sig) return;
     if (!box) {
@@ -1926,7 +2041,7 @@ class PropertyPanel {
     box.dataset.path = file.path;
     box.dataset.prop = prop;
     box.empty();
-    for (const v of values) renderOptionPill(box, v, this.schemas.colorOf(prop, v) || "default");
+    for (const v of values) renderOptionPill(box, v, this.schemas.colorOf(prop, v, file) || "default");
     if (!values.length) box.createSpan({ cls: "nk-select-empty", text: "Empty" });
   }
 }
@@ -4877,6 +4992,34 @@ class NotionStyleKanbanPlugin extends obsidian.Plugin {
     this.activeOptions.open();
   }
 
+  // One-time clean-up (0.18.0): notes that got a separate "Notes Status" property go back to
+  // Status, now that each database can have its own Status options.
+  async mergeNotesStatus() {
+    const OLD = "Notes Status";
+    const todo = [];
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      const fm = (this.app.metadataCache.getFileCache(file) || {}).frontmatter;
+      if (fm && Object.keys(fm).some((k) => sameText(k, OLD))) todo.push(file);
+    }
+    if (!todo.length) return new obsidian.Notice('No notes have a "Notes Status" property.');
+    const run = async () => {
+      let n = 0;
+      for (const file of todo) {
+        await this.app.fileManager.processFrontMatter(file, (fm) => {
+          const k = Object.keys(fm).find((x) => sameText(x, OLD));
+          if (!k) return;
+          const v = asString(Array.isArray(fm[k]) ? fm[k][0] : fm[k]).trim();
+          const sk = Object.keys(fm).find((x) => sameText(x, "Status")) || "Status";
+          if (v) fm[sk] = v;
+          delete fm[k];
+          n++;
+        });
+      }
+      new obsidian.Notice(`Moved "Notes Status" into Status on ${n} note${n === 1 ? "" : "s"}.`);
+    };
+    new ConfirmModal(this.app, 'Move "Notes Status" into Status?', `${todo.length} note${todo.length === 1 ? "" : "s"} have "Notes Status". Its value replaces Status (when it has one) and the "Notes Status" property is removed.`, "Move", run).open();
+  }
+
   schemaChanged() {
     this.app.workspace.trigger("nk:schema-changed");
   }
@@ -4979,6 +5122,11 @@ class NotionStyleKanbanPlugin extends obsidian.Plugin {
         if (!checking) this.openIconPicker(file, "icon");
         return true;
       },
+    });
+    this.addCommand({
+      id: "merge-notes-status",
+      name: "Move \"Notes Status\" back into Status",
+      callback: () => this.mergeNotesStatus(),
     });
     if (typeof this.registerBasesView !== "function") {
       new obsidian.Notice("Notion-style Kanban needs Obsidian 1.10 or later (Bases view API).");

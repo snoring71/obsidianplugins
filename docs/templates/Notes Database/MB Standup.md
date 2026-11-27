@@ -4,6 +4,7 @@ Task Board Item: []
 Related: []
 Topic: MB Standup
 icon: "icons/document_orange"
+Date: "{{now:YYYY-MM-DDTHH:mm}}"
 Created: "{{now}}"
 title: "MB Standup"
 ---
