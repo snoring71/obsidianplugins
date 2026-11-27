@@ -2996,6 +2996,166 @@ function initials(name) {
   return ((parts[0] || "?")[0] + (parts.length > 1 ? parts[parts.length - 1][0] : "")).toUpperCase();
 }
 
+// "[[" link suggestions for plain textareas (comment boxes), modeled on
+// Obsidian's editor link suggester: type [[, pick a note, get [[link]].
+class TextareaLinkSuggest {
+  constructor(app, textarea, sourcePath) {
+    this.app = app;
+    this.el = textarea;
+    this.sourcePath = sourcePath || "";
+    this.popup = null;
+    this.items = [];
+    this.selected = 0;
+    this.start = -1;
+    const refresh = () => this.update();
+    textarea.addEventListener("input", refresh);
+    textarea.addEventListener("click", refresh);
+    textarea.addEventListener("blur", () => window.setTimeout(() => this.close(), 150));
+  }
+
+  isOpen() { return !!this.popup; }
+
+  // Call first from the textarea's keydown handler; returns true when the
+  // key was used by the suggester (so the caller must not act on it).
+  handleKey(e) {
+    if (!this.popup) {
+      if (e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === "Home" || e.key === "End") window.setTimeout(() => this.update(), 0);
+      return false;
+    }
+    if (e.key === "ArrowDown" || (e.key === "n" && e.ctrlKey)) { this.move(1); e.preventDefault(); return true; }
+    if (e.key === "ArrowUp" || (e.key === "p" && e.ctrlKey)) { this.move(-1); e.preventDefault(); return true; }
+    if ((e.key === "Enter" && !e.isComposing) || e.key === "Tab") {
+      e.preventDefault();
+      if (this.items.length) this.choose(this.items[this.selected]); else this.close();
+      return true;
+    }
+    if (e.key === "Escape") { e.preventDefault(); this.close(); return true; }
+    if (e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === "Home" || e.key === "End") window.setTimeout(() => this.update(), 0);
+    return false;
+  }
+
+  update() {
+    const ta = this.el;
+    if (ta.selectionStart !== ta.selectionEnd) return this.close();
+    const caret = ta.selectionStart;
+    const before = ta.value.slice(0, caret);
+    const m = before.match(/\[\[([^\[\]\|#\n]*)$/);
+    if (!m) return this.close();
+    this.start = caret - m[0].length;
+    this.query = m[1];
+    this.items = this.search(m[1]);
+    this.selected = 0;
+    this.render();
+  }
+
+  search(query) {
+    const files = this.app.vault.getFiles().filter((f) => f.path !== this.sourcePath);
+    const q = query.trim();
+    const out = [];
+    if (!q) {
+      // Like Obsidian: most recently opened first, then most recently edited.
+      const recent = (this.app.workspace.getLastOpenFiles ? this.app.workspace.getLastOpenFiles() : []);
+      const byPath = new Map(files.map((f) => [f.path, f]));
+      const seen = new Set();
+      for (const p of recent) { const f = byPath.get(p); if (f && !seen.has(p)) { seen.add(p); out.push(f); } }
+      const rest = files.filter((f) => !seen.has(f.path)).sort((a, b) => b.stat.mtime - a.stat.mtime);
+      return out.concat(rest).slice(0, 20).map((f) => ({ file: f }));
+    }
+    const fuzzy = obsidian.prepareFuzzySearch(q);
+    const scored = [];
+    for (const f of files) {
+      const title = f.extension === "md" ? displayTitle(f, this.app) : f.name;
+      const name = f.extension === "md" ? f.basename : f.name;
+      let best = null;
+      for (const s of [title, name, f.path]) {
+        const r = fuzzy(s);
+        if (r && (!best || r.score > best.score)) best = r;
+      }
+      if (best) scored.push({ file: f, score: best.score + (f.extension === "md" ? 0 : -1) });
+    }
+    scored.sort((a, b) => b.score - a.score || a.file.path.length - b.file.path.length);
+    return scored.slice(0, 30);
+  }
+
+  render() {
+    if (!this.el.isConnected) return this.close();
+    if (!this.popup) {
+      // The panel can be rebuilt under us; drop the popup if the box goes away.
+      this.watch = window.setInterval(() => { if (!this.el.isConnected || document.activeElement !== this.el) this.close(); }, 300);
+      this.popup = document.body.createDiv({ cls: "suggestion-container nk-link-suggest" });
+      this.listEl = this.popup.createDiv({ cls: "suggestion" });
+    }
+    this.listEl.empty();
+    if (!this.items.length) {
+      this.listEl.createDiv({ cls: "suggestion-empty", text: "No match found" });
+    }
+    this.items.forEach((it, i) => {
+      const f = it.file;
+      const row = this.listEl.createDiv({ cls: "suggestion-item mod-complex" + (i === this.selected ? " is-selected" : "") });
+      const content = row.createDiv({ cls: "suggestion-content" });
+      const title = f.extension === "md" ? displayTitle(f, this.app) : f.name;
+      content.createDiv({ cls: "suggestion-title", text: title });
+      const folder = f.parent && f.parent.path !== "/" ? f.parent.path : "";
+      const note = title !== f.basename && f.extension === "md" ? (folder ? folder + "/" : "") + f.basename : folder;
+      if (note) content.createDiv({ cls: "suggestion-note", text: note });
+      row.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); this.choose(it); });
+      row.addEventListener("mousemove", () => { if (this.selected !== i) { this.selected = i; this.highlight(); } });
+    });
+    this.position();
+  }
+
+  highlight() {
+    const rows = this.listEl.querySelectorAll(".suggestion-item");
+    rows.forEach((r, i) => r.toggleClass("is-selected", i === this.selected));
+    const cur = rows[this.selected];
+    if (cur) cur.scrollIntoView({ block: "nearest" });
+  }
+
+  move(d) {
+    if (!this.items.length) return;
+    this.selected = (this.selected + d + this.items.length) % this.items.length;
+    this.highlight();
+  }
+
+  position() {
+    const r = this.el.getBoundingClientRect();
+    const p = this.popup;
+    p.style.position = "fixed";
+    p.style.left = Math.max(8, Math.min(r.left, window.innerWidth - 360)) + "px";
+    p.style.width = Math.max(280, Math.min(r.width, 420)) + "px";
+    const below = window.innerHeight - r.bottom;
+    if (below < 240 && r.top > below) {
+      p.style.top = "";
+      p.style.bottom = (window.innerHeight - r.top + 4) + "px";
+    } else {
+      p.style.bottom = "";
+      p.style.top = (r.bottom + 4) + "px";
+    }
+  }
+
+  choose(it) {
+    const ta = this.el;
+    const f = it.file;
+    const link = this.app.metadataCache.fileToLinktext(f, this.sourcePath, f.extension === "md");
+    const caret = ta.selectionStart;
+    let end = caret;
+    if (ta.value.slice(caret, caret + 2) === "]]") end += 2;
+    const text = "[[" + link + "]]";
+    ta.value = ta.value.slice(0, this.start) + text + ta.value.slice(end);
+    const pos = this.start + text.length;
+    ta.setSelectionRange(pos, pos);
+    this.close();
+    ta.focus();
+    ta.dispatchEvent(new Event("input"));
+  }
+
+  close() {
+    if (this.popup) { this.popup.remove(); this.popup = null; }
+    if (this.watch) { window.clearInterval(this.watch); this.watch = null; }
+    this.items = [];
+  }
+}
+
 class CommentsPanel {
   constructor(plugin) {
     this.plugin = plugin;
@@ -3127,9 +3287,11 @@ class CommentsPanel {
           row.removeClass("is-editing");
           await this.editComment(file, thread, idx, c, value);
         };
+        const boxSuggest = new TextareaLinkSuggest(this.app, box, file.path);
         box.addEventListener("input", grow);
         box.addEventListener("keydown", (e) => {
           e.stopPropagation();
+          if (boxSuggest.handleKey(e)) return;
           if (e.key === "Escape") { e.preventDefault(); close(); }
           else if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); commit(); }
         });
@@ -3164,9 +3326,11 @@ class CommentsPanel {
       grow();
       await this.addComment(file, value);
     };
+    const inputSuggest = new TextareaLinkSuggest(this.app, input, file.path);
     input.addEventListener("input", grow);
     input.addEventListener("keydown", (ev) => {
       ev.stopPropagation();
+      if (inputSuggest.handleKey(ev)) return;
       if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) {
         ev.preventDefault();
         submit();
@@ -3236,6 +3400,20 @@ class CommentsPanel {
   // Imported mentions of Notion pages are links to notion.so. When that page is
   // a note in this vault, open the note instead.
   linkNotionMentions(el, file) {
+    // Wiki links rendered inside the comment: open the note on click, like
+    // links in reading view (MarkdownRenderer output isn't wired up itself).
+    el.querySelectorAll("a.internal-link").forEach((a) => {
+      const dest = a.getAttribute("data-href") || a.getAttribute("href") || "";
+      if (!dest) return;
+      a.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        this.app.workspace.openLinkText(dest, file.path, obsidian.Keymap.isModEvent(ev));
+      }, true);
+      a.addEventListener("mouseover", (ev) => {
+        this.app.workspace.trigger("hover-link", { event: ev, source: "preview", hoverParent: el, targetEl: a, linktext: dest, sourcePath: file.path });
+      });
+    });
     el.querySelectorAll("a[href]").forEach((a) => {
       const href = a.getAttribute("href") || "";
       const m = /notion\.(?:so|com)\/(?:[^?#]*?)([0-9a-f]{32})(?:[?#]|$)/i.exec(href.replace(/-/g, ""));

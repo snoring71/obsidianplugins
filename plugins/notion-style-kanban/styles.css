@@ -693,3 +693,7 @@ body.nk-comments-on .markdown-source-view.is-live-preview .cm-embed-block.cm-cal
 .nk-titles-old { color: var(--text-muted); flex: 1 1 50%; overflow-wrap: anywhere; }
 .nk-titles-arrow { color: var(--text-faint); }
 .nk-titles-new { flex: 1 1 50%; overflow-wrap: anywhere; }
+
+/* "[[" link suggestions in comment boxes */
+.nk-link-suggest { z-index: var(--layer-popover, 40); max-height: 300px; overflow-y: auto; }
+.nk-link-suggest .suggestion-note { font-size: var(--font-ui-smaller); color: var(--text-muted); }
