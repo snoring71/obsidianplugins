@@ -868,3 +868,105 @@ body.nk-comments-on .markdown-source-view.is-live-preview .cm-embed-block.cm-cal
 .is-mobile .nk-sb-tools { opacity: 1; }
 .is-mobile .nk-sb-row,
 .is-mobile .nk-sb-action { min-height: 36px; }
+/* ---------- @ menu, date chips, date editor, inbox ---------- */
+.nk-at-item { flex-direction: column; align-items: stretch; }
+.nk-at-header { font-size: var(--font-ui-smaller); font-weight: 600; color: var(--text-muted); margin: 2px 0 6px; pointer-events: none; }
+.suggestion-item.nk-at-item:has(.nk-at-header) { padding-top: 8px; }
+.nk-at-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.nk-at-icon { flex: 0 0 auto; width: 18px; display: inline-flex; justify-content: center; color: var(--text-muted); }
+.nk-at-icon svg { width: 16px; height: 16px; }
+.nk-at-row .suggestion-content { min-width: 0; }
+.nk-at-row .suggestion-note { font-size: var(--font-ui-smaller); color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.nk-date-chip {
+  display: inline-flex; align-items: center; gap: 1px;
+  color: var(--text-muted); cursor: pointer; border-radius: 4px; padding: 0 2px;
+  white-space: nowrap;
+}
+.nk-date-chip:hover { background: var(--background-modifier-hover); }
+.nk-date-chip .nk-date-at { opacity: 0.6; }
+.nk-date-chip.has-reminder { color: rgb(35, 131, 226); }
+.nk-date-chip.has-reminder.is-past { color: rgb(205, 60, 58); }
+.nk-date-bell { display: inline-flex; margin-left: 3px; }
+.nk-date-bell svg { width: 0.9em; height: 0.9em; }
+
+.nk-date-pop {
+  position: fixed; z-index: var(--layer-menu, 65); width: 260px;
+  background: var(--background-primary); border: 1px solid var(--background-modifier-border);
+  border-radius: 8px; box-shadow: var(--shadow-l); padding: 8px; font-size: 13px;
+}
+.nk-date-inputs { display: flex; gap: 6px; margin-bottom: 8px; }
+.nk-date-inputs input { flex: 1 1 0; min-width: 0; height: 28px; font-size: 13px; padding: 0 6px; }
+.nk-cal-nav { display: flex; align-items: center; justify-content: space-between; padding: 2px 2px 6px; }
+.nk-cal-month { font-weight: 600; }
+.nk-cal-btns { display: flex; align-items: center; gap: 2px; }
+.nk-cal-today { font-size: 12px; color: var(--text-muted); padding: 2px 6px; border-radius: 4px; cursor: pointer; }
+.nk-cal-btn { display: inline-flex; padding: 2px; border-radius: 4px; cursor: pointer; color: var(--text-muted); }
+.nk-cal-today:hover, .nk-cal-btn:hover { background: var(--background-modifier-hover); }
+.nk-cal-btn svg { width: 16px; height: 16px; }
+.nk-cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 1px; text-align: center; }
+.nk-cal-wd { font-size: 11px; color: var(--text-faint); padding: 2px 0; }
+.nk-cal-day { padding: 4px 0; border-radius: 4px; cursor: pointer; }
+.nk-cal-day:hover { background: var(--background-modifier-hover); }
+.nk-cal-day.is-other { color: var(--text-faint); }
+.nk-cal-day.is-today { color: rgb(205, 60, 58); font-weight: 600; }
+.nk-cal-day.is-selected { background: rgb(35, 131, 226); color: #fff; }
+.nk-date-opts { border-top: 1px solid var(--background-modifier-border); margin-top: 8px; padding-top: 6px; }
+.nk-date-opt { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 2px; }
+.nk-date-opt select { max-width: 160px; font-size: 12px; }
+.nk-date-foot { border-top: 1px solid var(--background-modifier-border); margin-top: 6px; padding-top: 4px; }
+.nk-date-remove { display: flex; align-items: center; gap: 8px; padding: 4px 2px; border-radius: 4px; cursor: pointer; color: var(--text-muted); }
+.nk-date-remove:hover { background: var(--background-modifier-hover); color: var(--text-error); }
+.nk-date-remove svg { width: 15px; height: 15px; }
+
+.nk-reminder-notice { cursor: pointer; }
+.nk-reminder-notice-head { display: flex; align-items: center; gap: 6px; font-size: 12px; opacity: 0.8; }
+.nk-reminder-notice-head svg { width: 14px; height: 14px; }
+.nk-reminder-notice-title { font-weight: 600; margin-top: 2px; }
+.nk-reminder-notice-text { font-size: 12px; opacity: 0.85; }
+
+.nk-inbox-ribbon { position: relative; }
+.nk-inbox-ribbon.has-unread::after {
+  content: attr(data-count); position: absolute; top: 0; right: -2px;
+  min-width: 15px; height: 15px; padding: 0 3px; border-radius: 8px;
+  background: rgb(205, 60, 58); color: #fff; font-size: 10px; line-height: 15px; text-align: center;
+}
+.nk-inbox { padding: 0 !important; }
+.nk-inbox-head { position: sticky; top: 0; background: var(--background-secondary); z-index: 1; padding: 8px 10px 6px; border-bottom: 1px solid var(--background-modifier-border); }
+.nk-inbox-tabs { display: flex; gap: 4px; margin-bottom: 6px; }
+.nk-inbox-tab { padding: 3px 8px; border-radius: 6px; cursor: pointer; color: var(--text-muted); font-size: 13px; }
+.nk-inbox-tab:hover { background: var(--background-modifier-hover); }
+.nk-inbox-tab.is-active { background: var(--background-modifier-active-hover, var(--background-modifier-hover)); color: var(--text-normal); font-weight: 600; }
+.nk-inbox-tools { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.nk-inbox-tools select { font-size: 12px; }
+.nk-inbox-tool { display: inline-flex; padding: 4px; border-radius: 4px; cursor: pointer; color: var(--text-muted); }
+.nk-inbox-tool:hover { background: var(--background-modifier-hover); }
+.nk-inbox-tool svg { width: 16px; height: 16px; }
+.nk-inbox-list { padding: 4px 4px 16px; }
+.nk-inbox-empty { color: var(--text-muted); padding: 24px 12px; text-align: center; font-size: 13px; }
+.nk-inbox-day { font-size: 12px; font-weight: 600; color: var(--text-muted); padding: 10px 8px 4px; }
+.nk-inbox-item { display: flex; gap: 10px; align-items: flex-start; padding: 8px; border-radius: 6px; cursor: pointer; }
+.nk-inbox-item:hover { background: var(--background-modifier-hover); }
+.nk-inbox-icon { flex: 0 0 auto; display: inline-flex; color: rgb(35, 131, 226); margin-top: 2px; }
+.nk-inbox-icon svg { width: 16px; height: 16px; }
+.nk-inbox-main { flex: 1 1 auto; min-width: 0; }
+.nk-inbox-top { display: flex; gap: 6px; font-size: 12px; color: var(--text-muted); }
+.nk-inbox-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+.nk-inbox-text { font-size: 13px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.nk-inbox-dot { flex: 0 0 auto; width: 18px; height: 18px; display: flex; align-items: center; justify-content: center; border-radius: 50%; }
+.nk-inbox-dot::after { content: ""; width: 8px; height: 8px; border-radius: 50%; background: rgb(35, 131, 226); }
+.nk-inbox-item.is-read .nk-inbox-dot::after { background: transparent; border: 1px solid var(--text-faint); }
+.nk-inbox-item.is-read .nk-inbox-title { font-weight: 500; color: var(--text-muted); }
+.nk-inbox-dot:hover { background: var(--background-modifier-hover); }
+/* sidebar: unread count on the Inbox row */
+.nk-sb-action .nk-sb-count {
+  margin-left: auto;
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: rgb(235, 87, 87);
+  color: #fff;
+  font-size: 11px;
+  line-height: 18px;
+  text-align: center;
+}

@@ -7,7 +7,7 @@ it sits in the left drawer and closes itself after you open something.
 
 ## What it shows
 
-- **Search** opens the quick switcher. **New page** makes an empty page in the root folder.
+- **Search** opens the quick switcher. **Inbox** opens the reminders inbox (with the unread count). **New page** makes an empty page in the root folder.
 - **Favorites**: anything you starred. Star from a row's ⋯ menu, or right-click any note, base or
   folder in the file explorer and choose "Add to Favorites".
 - **Private**: everything under the root folder (`Notion` by default, the importer's output).
