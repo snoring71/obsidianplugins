@@ -1906,8 +1906,14 @@ class ViewTabsBar {
 //
 // A ```notion-button``` code block draws a button. Its body is YAML:
 //   label: Add subtask
-//   action: add-subtask | complete-subtask | unparent-all | insert
-// See docs/notion-buttons.md for every option.
+//   icon: plus
+//   confirm: Are you sure?            (optional)
+//   steps:                            (or a single top-level `action:`)
+//     - action: add-subtask
+//       name: Subtask
+// "Insert button" (command, or right-click in the editor) picks a ready-made
+// button or builds a new one step by step; the gear on a button edits it.
+// See docs/notion-buttons.md.
 
 const BUTTON_DEFAULTS = {
   parentProperty: "Parent task",
@@ -1915,11 +1921,151 @@ const BUTTON_DEFAULTS = {
   completedProperty: "Completed Tasks",
   statusProperty: "Status",
 };
+const BUTTON_KEYS = Object.keys(BUTTON_DEFAULTS);
 const DEFAULT_SUBTASK_TEMPLATE = "Templates/RM Tasks/RM Sub-task.md";
 const TEMPLATE_SKIP_KEYS = new Set(["base", "notion-id", "position", "manual_order", "Last edited time"]);
 
+const STEP_TYPES = [
+  { id: "add-subtask", name: "Add sub-task", icon: "list-plus", desc: "Create a note with Parent task = this page" },
+  { id: "add-task", name: "Add task", icon: "file-plus", desc: "Create a note from a template, not linked to this page" },
+  { id: "complete-subtask", name: "Move to Completed Tasks", icon: "check-square", desc: "On a sub-task: move it to the parent's Completed Tasks and set its status" },
+  { id: "unparent-all", name: "Un-parent all sub-tasks", icon: "unlink", desc: "Clear this page's Sub-task list and each child's Parent task" },
+  { id: "adopt-matching", name: "Make matching tasks sub-tasks", icon: "filter", desc: "Find tasks that match filters and set their Parent task to this page" },
+  { id: "edit-properties", name: "Edit this page's properties", icon: "pencil", desc: "Set, add to or remove from this page's properties" },
+  { id: "rename", name: "Rename this page", icon: "text-cursor-input", desc: "Give this page a new name, with optional dates" },
+  { id: "insert", name: "Insert text", icon: "text", desc: "Insert lines above or below the button" },
+];
+const STEP_TYPE = Object.fromEntries(STEP_TYPES.map((t) => [t.id, t]));
+
+const FILTER_OPS = [
+  ["contains", "contains"],
+  ["not-contains", "does not contain"],
+  ["is", "is"],
+  ["is-not", "is not"],
+  ["is-any", "is any of (comma separated)"],
+  ["starts-with", "starts with"],
+  ["not-starts-with", "does not start with"],
+  ["is-empty", "is empty"],
+  ["not-empty", "is not empty"],
+];
+
+const RP = "Templates/RM Tasks/RP - ";
+const BUILTIN_BUTTONS = [
+  { label: "Add subtask", icon: "plus", steps: [{ action: "add-subtask", name: "Subtask", template: DEFAULT_SUBTASK_TEMPLATE }] },
+  { label: "Move to Completed Tasks and set to Closed", icon: "check-square", steps: [{ action: "complete-subtask", status: "Closed" }] },
+  { label: "Un-parent all sub-tasks", icon: "unlink", steps: [{ action: "unparent-all" }] },
+  {
+    label: "Add standard test item tasks",
+    icon: "list-checks",
+    steps: [{ action: "insert", position: "above", text: "- [ ] Test in .local\n- [ ] Enter CCB\n- [ ] Deploy to 1x/2x\n- [ ] Update BCM" }],
+  },
+  {
+    label: "Create release planning subtasks",
+    icon: "calendar-plus",
+    confirm: "Are you sure you want to create sub-tasks?",
+    steps: [
+      { action: "add-subtask", name: "Create RM work item and SPR", template: RP + "Create RM work item and SPR.md", open: "none" },
+      { action: "add-subtask", name: "Get initial list of candidate sites", template: RP + "Get initial list of candidate sites.md", open: "none" },
+      { action: "add-subtask", name: "Create release planning document", template: RP + "Create release planning document.md", open: "none" },
+      { action: "add-subtask", name: "Schedule release planning meeting", template: RP + "Schedule release planning meeting.md", open: "none" },
+      { action: "add-subtask", name: "Hold meeting and update document-SPR", template: RP + "Hold meeting and update document-SPR-Notion-Pilot board.md", open: "none" },
+    ],
+  },
+  {
+    label: "Create new \"Waiting for CCB meeting\" holder task",
+    icon: "clock",
+    confirm: "Are you sure you want to create a new task? Please confirm that an open task does not already exist.",
+    steps: [{ action: "add-task", name: "Waiting for CCB meeting", template: "Templates/RM Tasks/Waiting for CCB meeting.md", open: "tab" }],
+  },
+  {
+    label: "Add tasks with \"Waiting for CCB meeting\" tag as sub-tasks",
+    icon: "filter",
+    steps: [{
+      action: "adopt-matching",
+      where: [
+        { property: "Tag", op: "contains", value: "Waiting for CCB meeting" },
+        { property: "Status", op: "is-any", value: "Not started, Up next, In progress" },
+        { property: "Parent task", op: "is-empty" },
+        { property: "file.name", op: "not-starts-with", value: "Waiting for CCB meeting" },
+      ],
+    }],
+  },
+  { label: "Add \"Waiting for CCB meeting\" tag", icon: "tag", steps: [{ action: "edit-properties", changes: [{ property: "Tag", mode: "add", value: "Waiting for CCB meeting" }] }] },
+  { label: "Remove \"Waiting for CCB meeting\" tag", icon: "x", steps: [{ action: "edit-properties", changes: [{ property: "Tag", mode: "remove", value: "Waiting for CCB meeting" }] }] },
+  { label: "Set Future tag and Date to next meeting", icon: "calendar", description: "Notes Database: renames to 1-1 Meeting <next Wednesday>", steps: [{ action: "rename", name: "1-1 Meeting {{next:wednesday:MM-DD-YYYY}}" }] },
+  { label: "Set Future tag and Date to next meeting (meeting is next Tuesday)", icon: "calendar", description: "Notes Database: renames to 1-1 Meeting <next Tuesday>", steps: [{ action: "rename", name: "1-1 Meeting {{next:tuesday:MM-DD-YYYY}}" }] },
+  { label: "Set Future tag and Date to next meeting (meeting is next next Tuesday)", icon: "calendar", description: "Notes Database: renames to 1-1 Meeting <the Tuesday after next>", steps: [{ action: "rename", name: "1-1 Meeting {{next:tuesday+1:MM-DD-YYYY}}" }] },
+];
+
+const WEEKDAYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+
 function safeFileName(name) {
   return String(name || "Untitled").replace(/[\\/:*?"<>|#^[\]]/g, "-").replace(/\s+/g, " ").trim() || "Untitled";
+}
+
+// {{today}}, {{today:YYYY-MM-DD}}, {{next:tuesday:MM-DD-YYYY}}, {{next:tue+1}} (one week later), {{title}}
+function expandVars(text, file) {
+  const m = obsidian.moment;
+  return String(text === undefined || text === null ? "" : text).replace(/\{\{\s*([^}]+?)\s*\}\}/g, (all, expr) => {
+    const parts = expr.split(":");
+    const kind = parts[0].trim().toLowerCase();
+    if (kind === "title") return file ? file.basename : "";
+    if (kind === "today" || kind === "date") return m().format(parts.slice(1).join(":") || "YYYY-MM-DD");
+    if (kind === "next") {
+      const spec = (parts[1] || "").trim().toLowerCase();
+      const mm = spec.match(/^([a-z]+)(?:\+(\d+))?$/);
+      const day = mm ? WEEKDAYS.findIndex((d) => d.startsWith(mm[1].slice(0, 3))) : -1;
+      if (day < 0) return all;
+      const now = m().startOf("day");
+      let add = day - now.day();
+      if (add < 0) add += 7; // the same weekday counts as "next" (Notion's formula)
+      add += 7 * Number(mm[2] || 0);
+      return now.add(add, "days").format(parts.slice(2).join(":") || "YYYY-MM-DD");
+    }
+    return all;
+  });
+}
+
+function normalizeButton(raw) {
+  const cfg = Object.assign({}, raw || {});
+  let steps = Array.isArray(cfg.steps) ? cfg.steps.filter((s) => s && typeof s === "object") : null;
+  if (!steps) {
+    // older single-action form: action + options at the top level
+    const step = { action: cfg.action || "add-subtask" };
+    for (const k of ["name", "template", "tasks", "properties", "open", "folder", "status", "text", "position", "where", "changes"]) {
+      if (cfg[k] !== undefined) step[k] = cfg[k];
+    }
+    if (step.action === "add-subtask" && step.template === undefined && !step.tasks) step.template = DEFAULT_SUBTASK_TEMPLATE;
+    steps = [step];
+  }
+  cfg.steps = steps.map((s) => Object.assign({}, s, { action: String(s.action || "add-subtask").toLowerCase() }));
+  for (const k of BUTTON_KEYS) if (cfg[k] === undefined) cfg[k] = BUTTON_DEFAULTS[k];
+  return cfg;
+}
+
+// The YAML we write back for a button: only what the user set
+function buttonToYaml(btn) {
+  const out = {};
+  out.label = btn.label || "Button";
+  if (btn.icon) out.icon = btn.icon;
+  if (btn.description) out.description = btn.description;
+  if (btn.confirm) out.confirm = btn.confirm;
+  for (const k of BUTTON_KEYS) if (btn[k] && btn[k] !== BUTTON_DEFAULTS[k]) out[k] = btn[k];
+  out.steps = (btn.steps || []).map((s) => {
+    const o = { action: s.action };
+    for (const [k, v] of Object.entries(s)) {
+      if (k === "action" || v === undefined || v === null || v === "") continue;
+      if (Array.isArray(v) && !v.length) continue;
+      if (typeof v === "object" && !Array.isArray(v) && !Object.keys(v).length) continue;
+      o[k] = v;
+    }
+    return o;
+  });
+  return obsidian.stringifyYaml(out).replace(/\s+$/, "");
+}
+
+function buttonBlock(btn) {
+  return "```notion-button\n" + buttonToYaml(btn) + "\n```\n";
 }
 
 class NoteButtons {
@@ -1932,12 +2078,22 @@ class NoteButtons {
     const p = this.plugin;
     p.registerMarkdownCodeBlockProcessor("notion-button", (src, el, ctx) => this.render(src, el, ctx));
     p.addCommand({
+      id: "insert-button",
+      name: "Insert button",
+      editorCallback: (editor) => this.openPicker(editor),
+    });
+    p.registerEvent(
+      this.app.workspace.on("editor-menu", (menu, editor) => {
+        menu.addItem((item) => item.setTitle("Insert button").setIcon("mouse-pointer-click").onClick(() => this.openPicker(editor)));
+      })
+    );
+    p.addCommand({
       id: "add-subtask",
       name: "Add sub-task to current note",
       checkCallback: (checking) => {
         const file = this.app.workspace.getActiveFile();
         if (!file || file.extension !== "md") return false;
-        if (!checking) this.guard(() => this.addSubtasks(this.config({}), file));
+        if (!checking) this.guard(() => this.runButton(normalizeButton(BUILTIN_BUTTONS[0]), file));
         return true;
       },
     });
@@ -1947,24 +2103,60 @@ class NoteButtons {
       checkCallback: (checking) => {
         const file = this.app.workspace.getActiveFile();
         if (!file || file.extension !== "md") return false;
-        if (!checking) this.guard(() => this.completeSubtask(this.config({}), file));
+        if (!checking) this.guard(() => this.runButton(normalizeButton(BUILTIN_BUTTONS[1]), file));
         return true;
       },
     });
   }
 
-  config(raw) {
-    const cfg = Object.assign({}, BUTTON_DEFAULTS, raw || {});
-    if (cfg.template === undefined && (cfg.action || "add-subtask") === "add-subtask" && !cfg.tasks) cfg.template = DEFAULT_SUBTASK_TEMPLATE;
-    return cfg;
+  // ----- library -----
+
+  library() {
+    const mine = asList(this.plugin.settings.buttonLibrary).filter((b) => b && typeof b === "object" && b.label);
+    return { builtin: BUILTIN_BUTTONS, mine };
   }
+
+  async saveToLibrary(btn) {
+    const fresh = (await this.plugin.loadData()) || {};
+    const list = asList(fresh.buttonLibrary).filter((b) => b && b.label !== btn.label);
+    list.push(JSON.parse(JSON.stringify(Object.assign({}, btn))));
+    this.plugin.settings.buttonLibrary = list;
+    await this.plugin.saveData(Object.assign(fresh, { buttonLibrary: list }));
+    new obsidian.Notice(`Saved "${btn.label}" to My buttons`);
+  }
+
+  async removeFromLibrary(label) {
+    const fresh = (await this.plugin.loadData()) || {};
+    const list = asList(fresh.buttonLibrary).filter((b) => b && b.label !== label);
+    this.plugin.settings.buttonLibrary = list;
+    await this.plugin.saveData(Object.assign(fresh, { buttonLibrary: list }));
+  }
+
+  openPicker(editor) {
+    new ButtonPickerModal(this, (btn) => {
+      if (!btn) {
+        new ButtonBuilderModal(this, null, (made) => this.insertBlock(editor, made)).open();
+        return;
+      }
+      this.insertBlock(editor, btn);
+    }).open();
+  }
+
+  insertBlock(editor, btn) {
+    const cur = editor.getCursor();
+    const line = editor.getLine(cur.line);
+    const before = line.trim() ? "\n" : "";
+    editor.replaceRange(before + buttonBlock(normalizeButton(btn)), { line: cur.line, ch: line.length });
+  }
+
+  // ----- rendering -----
 
   parse(src) {
     let raw;
     try { raw = obsidian.parseYaml(src); } catch (e) { return { error: e.message }; }
     if (raw === null || raw === undefined) raw = {};
     if (typeof raw !== "object" || Array.isArray(raw)) return { error: "the block should hold lines like  label: Add subtask" };
-    return this.config(raw);
+    return normalizeButton(raw);
   }
 
   render(src, el, ctx) {
@@ -1986,10 +2178,38 @@ class NoteButtons {
       if (!(file instanceof obsidian.TFile)) return;
       const run = () => {
         btn.disabled = true;
-        this.guard(() => this.run(cfg, file, el, ctx)).finally(() => { btn.disabled = false; });
+        this.guard(() => this.runButton(cfg, file, el, ctx)).finally(() => { btn.disabled = false; });
       };
       if (cfg.confirm) new ConfirmModal(this.app, String(cfg.label || "Confirm"), String(cfg.confirm), String(cfg.confirmText || "Continue"), run).open();
       else run();
+    });
+    const gear = wrap.createDiv({ cls: "nk-note-button-gear clickable-icon", attr: { "aria-label": "Edit button" } });
+    obsidian.setIcon(gear, "settings");
+    gear.addEventListener("mousedown", (ev) => ev.stopPropagation());
+    gear.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      new ButtonBuilderModal(this, cfg, (made) => this.guard(() => this.replaceBlock(ctx, el, src, made))).open();
+    });
+  }
+
+  async replaceBlock(ctx, el, src, btn) {
+    const file = this.app.vault.getAbstractFileByPath(ctx.sourcePath);
+    if (!(file instanceof obsidian.TFile)) return;
+    const info = ctx.getSectionInfo(el);
+    const block = buttonBlock(normalizeButton(btn)).replace(/\n$/, "");
+    await this.app.vault.process(file, (data) => {
+      const nl = data.includes("\r\n") ? "\r\n" : "\n";
+      const lines = data.split(/\r?\n/);
+      if (info && /^\s*(```|~~~)\s*notion-button/.test(lines[info.lineStart] || "")) {
+        lines.splice(info.lineStart, info.lineEnd - info.lineStart + 1, ...block.split("\n"));
+        return lines.join(nl);
+      }
+      const body = src.replace(/\s+$/, "");
+      const re = new RegExp("```notion-button\\r?\\n" + body.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\n/g, "\\r?\\n") + "\\s*\\r?\\n```");
+      if (re.test(data)) return data.replace(re, block.split("\n").join(nl));
+      new obsidian.Notice("Couldn't find this button in the note to update it.");
+      return data;
     });
   }
 
@@ -2000,13 +2220,55 @@ class NoteButtons {
     }
   }
 
-  async run(cfg, file, el, ctx) {
-    const action = String(cfg.action || "add-subtask").toLowerCase();
-    if (action === "add-subtask" || action === "add-subtasks") return this.addSubtasks(cfg, file);
-    if (action === "complete-subtask") return this.completeSubtask(cfg, file);
-    if (action === "unparent-all") return this.unparentAll(cfg, file);
-    if (action === "insert") return this.insertText(cfg, file, el, ctx);
-    new obsidian.Notice(`Unknown button action "${cfg.action}"`);
+  // ----- running -----
+
+  async runButton(cfg, file, el, ctx) {
+    const state = { file, created: [] };
+    for (const step of cfg.steps) {
+      await this.runStep(cfg, step, state, el, ctx);
+    }
+    const toOpen = state.created.filter((c) => c.open !== "none");
+    if (toOpen.length) {
+      const c = toOpen[0];
+      const leaf = c.open === "split" ? this.app.workspace.getLeaf("split") : this.app.workspace.getLeaf("tab");
+      await leaf.openFile(c.file, { state: { mode: "source" }, eState: { rename: "all" } });
+    } else if (state.created.length) {
+      const n = state.created.length;
+      new obsidian.Notice(n === 1 ? `Added "${state.created[0].file.basename}"` : `Added ${n} tasks`);
+    }
+  }
+
+  async runStep(cfg, step, state, el, ctx) {
+    const file = state.file;
+    switch (step.action) {
+      case "add-subtask":
+      case "add-subtasks": {
+        let specs = asList(step.tasks).map((t) => (typeof t === "string" ? { name: t } : t || {}));
+        if (!specs.length) specs = [step];
+        for (const spec of specs) {
+          const child = await this.createNote(cfg, Object.assign({}, step, spec), file, true);
+          state.created.push({ file: child, open: this.openMode(step, specs.length) });
+        }
+        return;
+      }
+      case "add-task": {
+        const note = await this.createNote(cfg, step, file, false);
+        state.created.push({ file: note, open: this.openMode(step, 1) });
+        return;
+      }
+      case "complete-subtask": return this.completeSubtask(cfg, step, file);
+      case "unparent-all": return this.unparentAll(cfg, file);
+      case "adopt-matching": return this.adoptMatching(cfg, step, file);
+      case "edit-properties": return this.editProperties(step, file);
+      case "rename": return this.renameNote(step, file);
+      case "insert": return this.insertText(step, file, el, ctx);
+      default: new obsidian.Notice(`Unknown button step "${step.action}"`);
+    }
+  }
+
+  openMode(step, count) {
+    const v = step.open === undefined ? (count === 1 ? "tab" : "none") : String(step.open).toLowerCase();
+    return v === "false" || v === "no" ? "none" : v;
   }
 
   // ----- links -----
@@ -2050,7 +2312,7 @@ class NoteButtons {
     let t = this.app.vault.getAbstractFileByPath(norm);
     if (!(t instanceof obsidian.TFile)) t = this.app.metadataCache.getFirstLinkpathDest(String(path).replace(/\.md$/, ""), "");
     if (!(t instanceof obsidian.TFile)) {
-      if (path !== DEFAULT_SUBTASK_TEMPLATE) new obsidian.Notice(`Template "${path}" not found; creating a blank note.`);
+      new obsidian.Notice(`Template "${path}" not found; creating a blank note.`);
       return { fm: {}, body: "" };
     }
     const text = await this.app.vault.read(t);
@@ -2065,51 +2327,39 @@ class NoteButtons {
 
   // ----- actions -----
 
-  // Notion: "Add page to RM Tasks as <template>, Name = ..., Parent task = This page"
-  async addSubtasks(cfg, parent) {
-    let specs = asList(cfg.tasks).map((t) => (typeof t === "string" ? { name: t } : t || {}));
-    if (!specs.length) specs = [{ name: cfg.name, template: cfg.template, properties: cfg.properties }];
-    const parentFm = this.fm(parent);
-    const folder = cfg.folder ? obsidian.normalizePath(String(cfg.folder)) : (parent.parent ? parent.parent.path : "");
-    const created = [];
-    for (const spec of specs) {
-      const tpl = await this.readTemplate(spec.template !== undefined ? spec.template : cfg.taskTemplate);
-      const base = safeFileName(spec.name || cfg.name || "Subtask");
-      const pathFor = (nm) => obsidian.normalizePath(`${folder && folder !== "/" ? folder + "/" : ""}${nm}.md`);
-      let name = base;
-      let n = 1;
-      while (this.app.vault.getAbstractFileByPath(pathFor(name))) name = `${base} ${n++}`;
-      const child = await this.app.vault.create(pathFor(name), tpl.body || "");
-      await this.app.fileManager.processFrontMatter(child, (fm) => {
-        for (const [k, v] of Object.entries(tpl.fm)) if (!TEMPLATE_SKIP_KEYS.has(k)) fm[k] = v;
-        if (parentFm.base) fm.base = parentFm.base;
-        fm[cfg.parentProperty] = [this.linkTo(parent)];
-        const props = Object.assign({}, cfg.properties || {}, spec.properties || {});
-        for (const [k, v] of Object.entries(props)) fm[k] = v;
-        if (cfg.statusProperty && (fm[cfg.statusProperty] === undefined || fm[cfg.statusProperty] === "")) fm[cfg.statusProperty] = "Not started";
-      });
-      created.push(child);
-    }
-    // the other side of the two-way relation (Obsidian doesn't keep it in sync on its own)
-    await this.app.fileManager.processFrontMatter(parent, (fm) => {
-      let list = asList(fm[cfg.subtaskProperty]);
-      for (const c of created) list = this.withLink(list, c, parent);
-      fm[cfg.subtaskProperty] = list;
+  // Notion: "Add page to RM Tasks as <template>", with Parent task = This page for sub-tasks
+  async createNote(cfg, step, from, asChild) {
+    const fromFm = this.fm(from);
+    const tplPath = step.template !== undefined ? step.template : (asChild ? DEFAULT_SUBTASK_TEMPLATE : "");
+    const tpl = await this.readTemplate(tplPath);
+    const folder = step.folder ? obsidian.normalizePath(String(step.folder)) : (from.parent ? from.parent.path : "");
+    const tplName = tplPath ? String(tplPath).split("/").pop().replace(/\.md$/, "") : "";
+    const base = safeFileName(expandVars(step.name || (asChild ? "Subtask" : tplName || "Untitled"), from));
+    const pathFor = (nm) => obsidian.normalizePath(`${folder && folder !== "/" ? folder + "/" : ""}${nm}.md`);
+    let name = base;
+    let n = 1;
+    while (this.app.vault.getAbstractFileByPath(pathFor(name))) name = `${base} ${n++}`;
+    const note = await this.app.vault.create(pathFor(name), expandVars(tpl.body || "", from));
+    await this.app.fileManager.processFrontMatter(note, (fm) => {
+      for (const [k, v] of Object.entries(tpl.fm)) if (!TEMPLATE_SKIP_KEYS.has(k)) fm[k] = v;
+      if (fromFm.base) fm.base = fromFm.base;
+      if (asChild) fm[cfg.parentProperty] = [this.linkTo(from)];
+      for (const [k, v] of Object.entries(step.properties || {})) fm[k] = typeof v === "string" ? expandVars(v, from) : v;
+      if (cfg.statusProperty && (fm[cfg.statusProperty] === undefined || fm[cfg.statusProperty] === "")) fm[cfg.statusProperty] = "Not started";
     });
-    const open = String(cfg.open === undefined ? (created.length === 1 ? "tab" : "none") : cfg.open).toLowerCase();
-    if (open !== "none" && open !== "false" && created.length) {
-      const leaf = open === "split" ? this.app.workspace.getLeaf("split") : this.app.workspace.getLeaf("tab");
-      await leaf.openFile(created[0], { state: { mode: "source" }, eState: { rename: "all" } });
-    } else {
-      new obsidian.Notice(created.length === 1 ? `Added sub-task "${created[0].basename}"` : `Added ${created.length} sub-tasks`);
+    if (asChild) {
+      // the other side of the two-way relation (Obsidian doesn't keep it in sync on its own)
+      await this.app.fileManager.processFrontMatter(from, (fm) => {
+        fm[cfg.subtaskProperty] = this.withLink(fm[cfg.subtaskProperty], note, from);
+      });
     }
-    return created;
+    return note;
   }
 
   // Notion: Completed Tasks += parent, Parent task -= parent, Status = Closed
-  async completeSubtask(cfg, child) {
+  async completeSubtask(cfg, step, child) {
     const parents = this.linkedFiles(this.fm(child)[cfg.parentProperty], child);
-    const status = cfg.status === undefined ? "Closed" : cfg.status;
+    const status = step.status === undefined ? "Closed" : step.status;
     await this.app.fileManager.processFrontMatter(child, (fm) => {
       let done = asList(fm[cfg.completedProperty]);
       for (const p of parents) done = this.withLink(done, p, child);
@@ -2140,12 +2390,99 @@ class NoteButtons {
     new obsidian.Notice(`Un-parented ${children.length} sub-task${children.length === 1 ? "" : "s"}`);
   }
 
+  matches(file, fm, rule) {
+    const prop = String(rule.property || "");
+    const raw = prop === "file.name" || prop.toLowerCase() === "name" ? file.basename : fm[prop];
+    const vals = asList(raw).map((v) => {
+      const s = asString(v);
+      const l = parseLink(s);
+      return (l.alias || (s.startsWith("[[") ? l.linkpath.split("/").pop() : s)).toLowerCase();
+    });
+    const want = String(rule.value === undefined || rule.value === null ? "" : rule.value).toLowerCase();
+    const any = want.split(",").map((x) => x.trim()).filter(Boolean);
+    switch (String(rule.op || "contains")) {
+      case "contains": return vals.some((v) => v === want || (vals.length === 1 && v.includes(want)));
+      case "not-contains": return !vals.some((v) => v === want || (vals.length === 1 && v.includes(want)));
+      case "is": return vals.length === 1 ? vals[0] === want : vals.includes(want);
+      case "is-not": return !(vals.length === 1 ? vals[0] === want : vals.includes(want));
+      case "is-any": return vals.some((v) => any.includes(v));
+      case "starts-with": return vals.some((v) => v.startsWith(want));
+      case "not-starts-with": return !vals.some((v) => v.startsWith(want));
+      case "is-empty": return vals.length === 0;
+      case "not-empty": return vals.length > 0;
+      default: return false;
+    }
+  }
+
+  // Notion: "Edit tasks that match <filters> in RM Tasks: Parent task = This page"
+  async adoptMatching(cfg, step, parent) {
+    const parentFm = this.fm(parent);
+    const sameBase = parentFm.base ? asString(parentFm.base) : null;
+    const rules = asList(step.where);
+    const hits = [];
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      if (f.path === parent.path) continue;
+      const fm = this.fm(f);
+      if (sameBase ? asString(fm.base) !== sameBase : (f.parent && parent.parent && f.parent.path !== parent.parent.path)) continue;
+      if (rules.every((r) => this.matches(f, fm, r))) hits.push(f);
+    }
+    for (const c of hits) {
+      const oldParents = this.linkedFiles(this.fm(c)[cfg.parentProperty], c).filter((p) => p.path !== parent.path);
+      await this.app.fileManager.processFrontMatter(c, (fm) => { fm[cfg.parentProperty] = [this.linkTo(parent)]; });
+      for (const op of oldParents) {
+        await this.app.fileManager.processFrontMatter(op, (fm) => { fm[cfg.subtaskProperty] = this.withoutLink(fm[cfg.subtaskProperty], c, op); });
+      }
+    }
+    await this.app.fileManager.processFrontMatter(parent, (fm) => {
+      let list = asList(fm[cfg.subtaskProperty]);
+      for (const c of hits) list = this.withLink(list, c, parent);
+      fm[cfg.subtaskProperty] = list;
+    });
+    new obsidian.Notice(`Added ${hits.length} matching task${hits.length === 1 ? "" : "s"} as sub-tasks`);
+  }
+
+  // Notion: "Edit This page: <property> set / add / remove <value>"
+  async editProperties(step, file) {
+    const changes = asList(step.changes);
+    await this.app.fileManager.processFrontMatter(file, (fm) => {
+      for (const ch of changes) {
+        const key = ch && ch.property;
+        if (!key) continue;
+        const mode = String(ch.mode || "set").toLowerCase();
+        const value = typeof ch.value === "string" ? expandVars(ch.value, file) : ch.value;
+        const values = asList(value).map((v) => (typeof v === "string" ? v : v));
+        if (mode === "add") {
+          const cur = asList(fm[key]);
+          for (const v of values) if (!cur.some((c) => asString(c).toLowerCase() === asString(v).toLowerCase())) cur.push(v);
+          fm[key] = cur;
+        } else if (mode === "remove") {
+          if (Array.isArray(fm[key])) fm[key] = fm[key].filter((c) => !values.some((v) => asString(c).toLowerCase() === asString(v).toLowerCase()));
+          else if (values.some((v) => asString(fm[key]).toLowerCase() === asString(v).toLowerCase())) fm[key] = "";
+        } else if (mode === "clear") {
+          fm[key] = Array.isArray(fm[key]) ? [] : "";
+        } else {
+          fm[key] = Array.isArray(fm[key]) && !Array.isArray(value) ? asList(value) : value;
+        }
+      }
+    });
+  }
+
+  async renameNote(step, file) {
+    const name = safeFileName(expandVars(step.name || file.basename, file));
+    if (name === file.basename) return;
+    const dir = file.parent && file.parent.path !== "/" ? file.parent.path + "/" : "";
+    let target = name;
+    let n = 1;
+    while (this.app.vault.getAbstractFileByPath(obsidian.normalizePath(`${dir}${target}.md`))) target = `${name} ${n++}`;
+    await this.app.fileManager.renameFile(file, obsidian.normalizePath(`${dir}${target}.md`));
+  }
+
   // Notion: "Insert blocks above/below button"
-  async insertText(cfg, file, el, ctx) {
-    const text = String(cfg.text || "").replace(/\s+$/, "");
+  async insertText(step, file, el, ctx) {
+    const text = expandVars(step.text || "", file).replace(/\s+$/, "");
     if (!text) return;
-    const info = ctx.getSectionInfo(el);
-    const below = String(cfg.position || "above").toLowerCase() === "below";
+    const info = ctx && el ? ctx.getSectionInfo(el) : null;
+    const below = String(step.position || "above").toLowerCase() === "below";
     await this.app.vault.process(file, (data) => {
       const nl = data.includes("\r\n") ? "\r\n" : "\n";
       const lines = data.split(/\r?\n/);
@@ -2155,6 +2492,290 @@ class NoteButtons {
       lines.splice(at, 0, ...add);
       return lines.join(nl);
     });
+  }
+}
+
+// ----- "Insert button": pick a ready-made button or start a new one -----
+
+class ButtonPickerModal extends obsidian.SuggestModal {
+  constructor(buttons, onPick) {
+    super(buttons.app);
+    this.buttons = buttons;
+    this.onPick = onPick;
+    this.setPlaceholder("Insert a button… (type to filter)");
+    this.setInstructions([{ command: "↵", purpose: "insert" }, { command: "esc", purpose: "cancel" }]);
+  }
+
+  getSuggestions(query) {
+    const q = query.trim().toLowerCase();
+    const { builtin, mine } = this.buttons.library();
+    const items = [{ kind: "new", label: "New button…", description: "Build a button step by step, like Notion" }];
+    for (const b of mine) items.push({ kind: "mine", label: b.label, btn: b });
+    for (const b of builtin) items.push({ kind: "builtin", label: b.label, btn: b });
+    return items.filter((it) => !q || it.label.toLowerCase().includes(q) || it.kind === "new");
+  }
+
+  renderSuggestion(it, el) {
+    el.addClass("nk-button-suggestion");
+    const icon = el.createSpan({ cls: "nk-button-suggestion-icon" });
+    if (it.kind === "new") obsidian.setIcon(icon, "plus");
+    else if (it.btn.icon) renderIconValue(icon, String(it.btn.icon));
+    else obsidian.setIcon(icon, "mouse-pointer-click");
+    const text = el.createDiv({ cls: "nk-button-suggestion-text" });
+    text.createDiv({ cls: "nk-button-suggestion-title", text: it.label });
+    const desc = it.kind === "new" ? it.description : (it.btn.description || this.summary(it.btn));
+    if (desc) text.createDiv({ cls: "nk-button-suggestion-desc", text: desc });
+    if (it.kind === "mine") {
+      el.createSpan({ cls: "nk-button-suggestion-badge", text: "My button" });
+      const del = el.createSpan({ cls: "nk-button-suggestion-del clickable-icon", attr: { "aria-label": "Remove from My buttons" } });
+      obsidian.setIcon(del, "trash-2");
+      del.addEventListener("click", async (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        await this.buttons.removeFromLibrary(it.label);
+        this.inputEl.dispatchEvent(new Event("input"));
+      });
+    }
+  }
+
+  summary(btn) {
+    const steps = normalizeButton(btn).steps;
+    return steps.map((s) => (STEP_TYPE[s.action] ? STEP_TYPE[s.action].name : s.action)).join(" → ");
+  }
+
+  onChooseSuggestion(it) {
+    this.onPick(it.kind === "new" ? null : it.btn);
+  }
+}
+
+// ----- the step builder (Notion's "When button is clicked / Do") -----
+
+class ButtonBuilderModal extends obsidian.Modal {
+  constructor(buttons, initial, onDone) {
+    super(buttons.app);
+    this.buttons = buttons;
+    this.onDone = onDone;
+    const start = initial ? normalizeButton(JSON.parse(JSON.stringify(initial))) : { label: "", steps: [] };
+    this.btn = {
+      label: start.label || "",
+      icon: start.icon || "",
+      description: start.description || "",
+      confirm: start.confirm || "",
+      steps: (start.steps || []).map((s) => Object.assign({}, s)),
+    };
+    for (const k of BUTTON_KEYS) if (start[k] && start[k] !== BUTTON_DEFAULTS[k]) this.btn[k] = start[k];
+    this.editing = !!initial;
+    this.saveToLibrary = false;
+  }
+
+  onOpen() {
+    this.modalEl.addClass("nk-button-builder");
+    this.titleEl.setText(this.editing ? "Edit button" : "New button");
+    this.draw();
+  }
+
+  onClose() { this.contentEl.empty(); }
+
+  templateFiles() {
+    return this.app.vault.getMarkdownFiles().filter((f) => /(^|\/)templates?\//i.test(f.path)).map((f) => f.path).sort();
+  }
+
+  draw() {
+    const c = this.contentEl;
+    c.empty();
+    const b = this.btn;
+
+    new obsidian.Setting(c).setName("Button name").addText((t) => t.setPlaceholder("Add subtask").setValue(b.label).onChange((v) => { b.label = v; }));
+    new obsidian.Setting(c)
+      .setName("Icon")
+      .setDesc("Optional. A Lucide icon name with an optional color (plus, check:green) or an emoji.")
+      .addText((t) => t.setPlaceholder("plus").setValue(b.icon).onChange((v) => { b.icon = v.trim(); }));
+
+    c.createDiv({ cls: "nk-bb-section", text: "When" });
+    const when = c.createDiv({ cls: "nk-bb-card nk-bb-when" });
+    obsidian.setIcon(when.createSpan({ cls: "nk-bb-card-icon" }), "mouse-pointer-click");
+    when.createSpan({ text: "Button is clicked" });
+
+    c.createDiv({ cls: "nk-bb-section", text: "Do" });
+    const confirmCard = c.createDiv({ cls: "nk-bb-card" });
+    new obsidian.Setting(confirmCard)
+      .setName("Show confirmation")
+      .addToggle((t) => t.setValue(!!b.confirm).onChange((v) => { b.confirm = v ? (b.confirm || "Are you sure?") : ""; this.draw(); }));
+    if (b.confirm) {
+      new obsidian.Setting(confirmCard).setName("Confirmation message").addText((t) => t.setValue(b.confirm).onChange((v) => { b.confirm = v || "Are you sure?"; }));
+    }
+
+    b.steps.forEach((step, i) => this.drawStep(c, step, i));
+
+    const addRow = c.createDiv({ cls: "nk-bb-add" });
+    const add = addRow.createEl("button", { cls: "nk-bb-add-btn" });
+    obsidian.setIcon(add.createSpan({ cls: "nk-bb-card-icon" }), "plus");
+    add.createSpan({ text: "Add action" });
+    add.onclick = (ev) => {
+      const menu = new obsidian.Menu();
+      for (const t of STEP_TYPES) {
+        menu.addItem((item) => item.setTitle(t.name).setIcon(t.icon).onClick(() => {
+          b.steps.push(this.newStep(t.id));
+          this.draw();
+        }));
+      }
+      menu.showAtMouseEvent(ev);
+    };
+
+    const foot = c.createDiv({ cls: "nk-bb-foot" });
+    new obsidian.Setting(foot)
+      .setName("Save to My buttons")
+      .setDesc("Adds it to the Insert button list so you can reuse it on other pages.")
+      .addToggle((t) => t.setValue(this.saveToLibrary).onChange((v) => { this.saveToLibrary = v; }));
+    const row = foot.createDiv({ cls: "modal-button-container" });
+    const done = row.createEl("button", { cls: "mod-cta", text: this.editing ? "Done" : "Insert" });
+    done.onclick = async () => {
+      if (!b.label.trim()) { new obsidian.Notice("Give the button a name first."); return; }
+      if (!b.steps.length) { new obsidian.Notice("Add at least one action."); return; }
+      const out = Object.assign({}, b, { label: b.label.trim() });
+      if (this.saveToLibrary) await this.buttons.saveToLibrary(out);
+      this.close();
+      this.onDone(out);
+    };
+    const cancel = row.createEl("button", { text: "Cancel" });
+    cancel.onclick = () => this.close();
+  }
+
+  newStep(id) {
+    if (id === "add-subtask") return { action: id, name: "Subtask", template: DEFAULT_SUBTASK_TEMPLATE, open: "tab" };
+    if (id === "add-task") return { action: id, name: "", template: "", open: "tab" };
+    if (id === "complete-subtask") return { action: id, status: "Closed" };
+    if (id === "adopt-matching") return { action: id, where: [{ property: "Tag", op: "contains", value: "" }] };
+    if (id === "edit-properties") return { action: id, changes: [{ property: "Tag", mode: "add", value: "" }] };
+    if (id === "rename") return { action: id, name: "{{title}}" };
+    if (id === "insert") return { action: id, text: "- [ ] ", position: "above" };
+    return { action: id };
+  }
+
+  drawStep(c, step, i) {
+    const b = this.btn;
+    const type = STEP_TYPE[step.action] || { name: step.action, icon: "help-circle", desc: "" };
+    const card = c.createDiv({ cls: "nk-bb-card nk-bb-step" });
+    const head = card.createDiv({ cls: "nk-bb-step-head" });
+    obsidian.setIcon(head.createSpan({ cls: "nk-bb-card-icon" }), type.icon);
+    head.createSpan({ cls: "nk-bb-step-title", text: type.name });
+    const tools = head.createDiv({ cls: "nk-bb-step-tools" });
+    const tool = (icon, label, fn, disabled) => {
+      const t = tools.createDiv({ cls: "clickable-icon" + (disabled ? " is-disabled" : ""), attr: { "aria-label": label } });
+      obsidian.setIcon(t, icon);
+      if (!disabled) t.onclick = fn;
+    };
+    tool("arrow-up", "Move up", () => { [b.steps[i - 1], b.steps[i]] = [b.steps[i], b.steps[i - 1]]; this.draw(); }, i === 0);
+    tool("arrow-down", "Move down", () => { [b.steps[i + 1], b.steps[i]] = [b.steps[i], b.steps[i + 1]]; this.draw(); }, i === b.steps.length - 1);
+    tool("trash-2", "Delete action", () => { b.steps.splice(i, 1); this.draw(); });
+    if (type.desc) card.createDiv({ cls: "nk-bb-step-desc", text: type.desc });
+
+    const text = (name, key, placeholder, desc) =>
+      new obsidian.Setting(card).setName(name).setDesc(desc || "").addText((t) => t.setPlaceholder(placeholder || "").setValue(step[key] === undefined ? "" : String(step[key])).onChange((v) => { step[key] = v; }));
+    const templateField = () => {
+      const s = new obsidian.Setting(card).setName("Template").setDesc("A note whose properties and content are copied into the new note.");
+      s.addText((t) => {
+        t.setPlaceholder("Templates/RM Tasks/RM Sub-task.md").setValue(step.template || "").onChange((v) => { step.template = v.trim(); });
+        const listId = "nk-bb-templates-" + Math.random().toString(36).slice(2);
+        const dl = card.createEl("datalist", { attr: { id: listId } });
+        for (const p of this.templateFiles()) dl.createEl("option", { attr: { value: p } });
+        t.inputEl.setAttr("list", listId);
+        t.inputEl.addClass("nk-bb-wide");
+      });
+    };
+    const openField = () =>
+      new obsidian.Setting(card).setName("Then").addDropdown((d) => d
+        .addOption("tab", "Open it in a new tab")
+        .addOption("split", "Open it to the right")
+        .addOption("none", "Don't open it")
+        .setValue(step.open || "tab")
+        .onChange((v) => { step.open = v; }));
+    const propsField = () => {
+      const s = new obsidian.Setting(card).setName("Also set").setDesc("One per line, like  Team: Personal");
+      s.addTextArea((t) => {
+        t.setPlaceholder("Team: Release Management").setValue(Object.entries(step.properties || {}).map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(", ") : v}`).join("\n"));
+        t.onChange((v) => {
+          const props = {};
+          for (const line of v.split(/\r?\n/)) {
+            const at = line.indexOf(":");
+            if (at > 0) props[line.slice(0, at).trim()] = line.slice(at + 1).trim();
+          }
+          step.properties = props;
+        });
+      });
+    };
+
+    switch (step.action) {
+      case "add-subtask":
+        text("Name", "name", "Subtask", "Use {{title}} for this page's name, {{today:MM-DD-YYYY}} for a date.");
+        templateField();
+        propsField();
+        openField();
+        break;
+      case "add-task":
+        text("Name", "name", "Leave empty to use the template's name");
+        templateField();
+        propsField();
+        openField();
+        break;
+      case "complete-subtask":
+        text("Set status to", "status", "Closed");
+        break;
+      case "unparent-all":
+        break;
+      case "adopt-matching": {
+        step.where = asList(step.where);
+        card.createDiv({ cls: "nk-bb-step-sub", text: "Tasks in the same database where every filter matches:" });
+        step.where.forEach((rule, k) => {
+          const s = new obsidian.Setting(card).setClass("nk-bb-rule");
+          s.addText((t) => t.setPlaceholder("Property (or file.name)").setValue(rule.property || "").onChange((v) => { rule.property = v.trim(); }));
+          s.addDropdown((d) => {
+            for (const [id, label] of FILTER_OPS) d.addOption(id, label);
+            d.setValue(rule.op || "contains").onChange((v) => { rule.op = v; this.draw(); });
+          });
+          if (!["is-empty", "not-empty"].includes(rule.op)) s.addText((t) => t.setPlaceholder("Value").setValue(rule.value === undefined ? "" : String(rule.value)).onChange((v) => { rule.value = v; }));
+          s.addExtraButton((x) => x.setIcon("x").setTooltip("Remove filter").onClick(() => { step.where.splice(k, 1); this.draw(); }));
+        });
+        new obsidian.Setting(card).addButton((x) => x.setButtonText("Add filter").onClick(() => { step.where.push({ property: "", op: "contains", value: "" }); this.draw(); }));
+        break;
+      }
+      case "edit-properties": {
+        step.changes = asList(step.changes);
+        step.changes.forEach((ch, k) => {
+          const s = new obsidian.Setting(card).setClass("nk-bb-rule");
+          s.addText((t) => t.setPlaceholder("Property").setValue(ch.property || "").onChange((v) => { ch.property = v.trim(); }));
+          s.addDropdown((d) => d
+            .addOption("set", "set to")
+            .addOption("add", "add")
+            .addOption("remove", "remove")
+            .addOption("clear", "clear")
+            .setValue(ch.mode || "set")
+            .onChange((v) => { ch.mode = v; this.draw(); }));
+          if (ch.mode !== "clear") s.addText((t) => t.setPlaceholder("Value").setValue(ch.value === undefined ? "" : asString(ch.value)).onChange((v) => { ch.value = v; }));
+          s.addExtraButton((x) => x.setIcon("x").setTooltip("Remove").onClick(() => { step.changes.splice(k, 1); this.draw(); }));
+        });
+        new obsidian.Setting(card).addButton((x) => x.setButtonText("Edit another property").onClick(() => { step.changes.push({ property: "", mode: "set", value: "" }); this.draw(); }));
+        break;
+      }
+      case "rename":
+        text("New name", "name", "1-1 Meeting {{next:tuesday:MM-DD-YYYY}}", "{{title}} = current name, {{today:FORMAT}}, {{next:tuesday:FORMAT}} = the coming Tuesday (today counts), {{next:tuesday+1:FORMAT}} = a week after that.");
+        break;
+      case "insert": {
+        new obsidian.Setting(card).setName("Text").addTextArea((t) => {
+          t.setValue(step.text || "").onChange((v) => { step.text = v; });
+          t.inputEl.rows = 4;
+          t.inputEl.addClass("nk-bb-wide");
+        });
+        new obsidian.Setting(card).setName("Where").addDropdown((d) => d
+          .addOption("above", "Above the button")
+          .addOption("below", "Below the button")
+          .setValue(step.position || "above")
+          .onChange((v) => { step.position = v; }));
+        break;
+      }
+      default:
+        card.createDiv({ cls: "nk-bb-step-sub", text: "This action can only be edited in the code block." });
+    }
   }
 }
 

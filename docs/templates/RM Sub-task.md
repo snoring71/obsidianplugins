@@ -19,5 +19,8 @@ icon: icons/square_lightgray
 
 ```notion-button
 label: Move to Completed Tasks and set to Closed
-action: complete-subtask
+icon: check-square
+steps:
+  - action: complete-subtask
+    status: Closed
 ```

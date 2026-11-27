@@ -538,7 +538,7 @@
 .nk-hidden-toggle-icon svg { width: 14px; height: 14px; }
 
 /* ---------- Notion-style buttons in notes (```notion-button```) ---------- */
-.nk-note-button-wrap { margin: 2px 0; }
+.nk-note-button-wrap { margin: 2px 0; display: flex; align-items: center; gap: 4px; }
 .block-language-notion-button { margin: 0; }
 .nk-note-button {
   display: inline-flex;
@@ -622,3 +622,37 @@ body.nk-comments-on .markdown-source-view.is-live-preview .cm-embed-block.cm-cal
   padding: 4px 0;
   font-size: var(--font-ui-small);
 }
+
+.nk-note-button-gear { opacity: 0; transition: opacity 80ms ease-in; color: var(--text-faint); }
+.nk-note-button-wrap:hover .nk-note-button-gear { opacity: 1; }
+.nk-note-button-gear svg { width: 14px; height: 14px; }
+
+/* "Insert button" picker */
+.nk-button-suggestion { display: flex; align-items: center; gap: 10px; }
+.nk-button-suggestion-icon { display: inline-flex; width: 20px; justify-content: center; color: var(--text-muted); }
+.nk-button-suggestion-icon svg { width: 16px; height: 16px; }
+.nk-button-suggestion-text { flex: 1; min-width: 0; }
+.nk-button-suggestion-desc { font-size: var(--font-ui-smaller); color: var(--text-muted); }
+.nk-button-suggestion-badge { font-size: var(--font-ui-smaller); color: var(--text-faint); }
+.nk-button-suggestion-del { opacity: 0.6; }
+.nk-button-suggestion-del:hover { opacity: 1; color: var(--text-error); }
+
+/* button builder ("When / Do" like Notion) */
+.nk-button-builder { width: min(640px, 92vw); }
+.nk-bb-section { margin: 16px 0 6px; font-size: var(--font-ui-small); color: var(--text-muted); }
+.nk-bb-card { border: 1px solid var(--background-modifier-border); border-radius: 8px; padding: 6px 12px; margin-bottom: 8px; background: var(--background-secondary); }
+.nk-bb-card .setting-item { border-top: none; padding: 6px 0; }
+.nk-bb-when { display: flex; align-items: center; gap: 8px; padding: 10px 12px; }
+.nk-bb-card-icon { display: inline-flex; color: var(--text-muted); }
+.nk-bb-card-icon svg { width: 16px; height: 16px; }
+.nk-bb-step-head { display: flex; align-items: center; gap: 8px; padding: 6px 0 2px; }
+.nk-bb-step-title { font-weight: 600; flex: 1; }
+.nk-bb-step-tools { display: flex; gap: 2px; }
+.nk-bb-step-tools .is-disabled { opacity: 0.3; cursor: default; }
+.nk-bb-step-desc, .nk-bb-step-sub { font-size: var(--font-ui-smaller); color: var(--text-muted); margin-bottom: 4px; }
+.nk-bb-rule .setting-item-info { display: none; }
+.nk-bb-rule .setting-item-control { justify-content: flex-start; flex-wrap: wrap; gap: 6px; }
+.nk-bb-wide { width: 100%; min-width: 260px; }
+.nk-bb-add-btn { display: inline-flex; align-items: center; gap: 6px; }
+.nk-bb-foot { margin-top: 12px; }
+.nk-bb-foot .setting-item { border-top: none; }
