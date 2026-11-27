@@ -1902,6 +1902,262 @@ class ViewTabsBar {
   }
 }
 
+// ---------- Notion-style buttons in notes ----------
+//
+// A ```notion-button``` code block draws a button. Its body is YAML:
+//   label: Add subtask
+//   action: add-subtask | complete-subtask | unparent-all | insert
+// See docs/notion-buttons.md for every option.
+
+const BUTTON_DEFAULTS = {
+  parentProperty: "Parent task",
+  subtaskProperty: "Sub-task",
+  completedProperty: "Completed Tasks",
+  statusProperty: "Status",
+};
+const DEFAULT_SUBTASK_TEMPLATE = "Templates/RM Tasks/RM Sub-task.md";
+const TEMPLATE_SKIP_KEYS = new Set(["base", "notion-id", "position", "manual_order", "Last edited time"]);
+
+function safeFileName(name) {
+  return String(name || "Untitled").replace(/[\\/:*?"<>|#^[\]]/g, "-").replace(/\s+/g, " ").trim() || "Untitled";
+}
+
+class NoteButtons {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.app = plugin.app;
+  }
+
+  load() {
+    const p = this.plugin;
+    p.registerMarkdownCodeBlockProcessor("notion-button", (src, el, ctx) => this.render(src, el, ctx));
+    p.addCommand({
+      id: "add-subtask",
+      name: "Add sub-task to current note",
+      checkCallback: (checking) => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file || file.extension !== "md") return false;
+        if (!checking) this.guard(() => this.addSubtasks(this.config({}), file));
+        return true;
+      },
+    });
+    p.addCommand({
+      id: "complete-subtask",
+      name: "Move current sub-task to Completed Tasks and set to Closed",
+      checkCallback: (checking) => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file || file.extension !== "md") return false;
+        if (!checking) this.guard(() => this.completeSubtask(this.config({}), file));
+        return true;
+      },
+    });
+  }
+
+  config(raw) {
+    const cfg = Object.assign({}, BUTTON_DEFAULTS, raw || {});
+    if (cfg.template === undefined && (cfg.action || "add-subtask") === "add-subtask" && !cfg.tasks) cfg.template = DEFAULT_SUBTASK_TEMPLATE;
+    return cfg;
+  }
+
+  parse(src) {
+    let raw;
+    try { raw = obsidian.parseYaml(src); } catch (e) { return { error: e.message }; }
+    if (raw === null || raw === undefined) raw = {};
+    if (typeof raw !== "object" || Array.isArray(raw)) return { error: "the block should hold lines like  label: Add subtask" };
+    return this.config(raw);
+  }
+
+  render(src, el, ctx) {
+    const cfg = this.parse(src);
+    const wrap = el.createDiv({ cls: "nk-note-button-wrap" });
+    if (cfg.error) {
+      wrap.createDiv({ cls: "nk-note-button-error", text: "Button settings can't be read: " + cfg.error });
+      return;
+    }
+    const btn = wrap.createEl("button", { cls: "nk-note-button" });
+    if (cfg.icon) renderIconValue(btn.createSpan({ cls: "nk-note-button-icon" }), String(cfg.icon));
+    btn.createSpan({ cls: "nk-note-button-label", text: String(cfg.label || "Button") });
+    if (cfg.description) btn.setAttr("aria-label", String(cfg.description));
+    btn.addEventListener("mousedown", (ev) => ev.stopPropagation());
+    btn.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const file = this.app.vault.getAbstractFileByPath(ctx.sourcePath);
+      if (!(file instanceof obsidian.TFile)) return;
+      const run = () => {
+        btn.disabled = true;
+        this.guard(() => this.run(cfg, file, el, ctx)).finally(() => { btn.disabled = false; });
+      };
+      if (cfg.confirm) new ConfirmModal(this.app, String(cfg.label || "Confirm"), String(cfg.confirm), String(cfg.confirmText || "Continue"), run).open();
+      else run();
+    });
+  }
+
+  async guard(fn) {
+    try { await fn(); } catch (e) {
+      console.error("[notion-style-kanban] button failed", e);
+      new obsidian.Notice("Button failed: " + (e && e.message ? e.message : e));
+    }
+  }
+
+  async run(cfg, file, el, ctx) {
+    const action = String(cfg.action || "add-subtask").toLowerCase();
+    if (action === "add-subtask" || action === "add-subtasks") return this.addSubtasks(cfg, file);
+    if (action === "complete-subtask") return this.completeSubtask(cfg, file);
+    if (action === "unparent-all") return this.unparentAll(cfg, file);
+    if (action === "insert") return this.insertText(cfg, file, el, ctx);
+    new obsidian.Notice(`Unknown button action "${cfg.action}"`);
+  }
+
+  // ----- links -----
+
+  fm(file) {
+    const c = this.app.metadataCache.getFileCache(file);
+    return (c && c.frontmatter) || {};
+  }
+  linkTo(file) {
+    return `[[${file.path.replace(/\.md$/, "")}|${file.basename}]]`;
+  }
+  resolve(raw, from) {
+    const { linkpath } = parseLink(raw);
+    if (!linkpath) return null;
+    return this.app.metadataCache.getFirstLinkpathDest(linkpath, from.path);
+  }
+  has(list, target, from) {
+    return asList(list).some((x) => { const f = this.resolve(x, from); return f && f.path === target.path; });
+  }
+  withLink(list, target, from) {
+    const l = asList(list);
+    return this.has(l, target, from) ? l : [...l, this.linkTo(target)];
+  }
+  withoutLink(list, target, from) {
+    return asList(list).filter((x) => { const f = this.resolve(x, from); return !(f && f.path === target.path); });
+  }
+  linkedFiles(list, from) {
+    const out = [];
+    for (const x of asList(list)) {
+      const f = this.resolve(x, from);
+      if (f instanceof obsidian.TFile && !out.some((o) => o.path === f.path)) out.push(f);
+    }
+    return out;
+  }
+
+  // ----- templates -----
+
+  async readTemplate(path) {
+    if (!path) return { fm: {}, body: "" };
+    const norm = obsidian.normalizePath(String(path).endsWith(".md") ? String(path) : String(path) + ".md");
+    let t = this.app.vault.getAbstractFileByPath(norm);
+    if (!(t instanceof obsidian.TFile)) t = this.app.metadataCache.getFirstLinkpathDest(String(path).replace(/\.md$/, ""), "");
+    if (!(t instanceof obsidian.TFile)) {
+      if (path !== DEFAULT_SUBTASK_TEMPLATE) new obsidian.Notice(`Template "${path}" not found; creating a blank note.`);
+      return { fm: {}, body: "" };
+    }
+    const text = await this.app.vault.read(t);
+    const c = this.app.metadataCache.getFileCache(t);
+    const end = c && c.frontmatterPosition ? c.frontmatterPosition.end.offset : -1;
+    let body = text;
+    if (end >= 0) body = text.slice(end).replace(/^\s*---\s*\r?\n?/, "").replace(/^\r?\n/, "");
+    else body = text.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "");
+    const fm = JSON.parse(JSON.stringify((c && c.frontmatter) || {}));
+    return { fm, body };
+  }
+
+  // ----- actions -----
+
+  // Notion: "Add page to RM Tasks as <template>, Name = ..., Parent task = This page"
+  async addSubtasks(cfg, parent) {
+    let specs = asList(cfg.tasks).map((t) => (typeof t === "string" ? { name: t } : t || {}));
+    if (!specs.length) specs = [{ name: cfg.name, template: cfg.template, properties: cfg.properties }];
+    const parentFm = this.fm(parent);
+    const folder = cfg.folder ? obsidian.normalizePath(String(cfg.folder)) : (parent.parent ? parent.parent.path : "");
+    const created = [];
+    for (const spec of specs) {
+      const tpl = await this.readTemplate(spec.template !== undefined ? spec.template : cfg.taskTemplate);
+      const base = safeFileName(spec.name || cfg.name || "Subtask");
+      const pathFor = (nm) => obsidian.normalizePath(`${folder && folder !== "/" ? folder + "/" : ""}${nm}.md`);
+      let name = base;
+      let n = 1;
+      while (this.app.vault.getAbstractFileByPath(pathFor(name))) name = `${base} ${n++}`;
+      const child = await this.app.vault.create(pathFor(name), tpl.body || "");
+      await this.app.fileManager.processFrontMatter(child, (fm) => {
+        for (const [k, v] of Object.entries(tpl.fm)) if (!TEMPLATE_SKIP_KEYS.has(k)) fm[k] = v;
+        if (parentFm.base) fm.base = parentFm.base;
+        fm[cfg.parentProperty] = [this.linkTo(parent)];
+        const props = Object.assign({}, cfg.properties || {}, spec.properties || {});
+        for (const [k, v] of Object.entries(props)) fm[k] = v;
+        if (cfg.statusProperty && (fm[cfg.statusProperty] === undefined || fm[cfg.statusProperty] === "")) fm[cfg.statusProperty] = "Not started";
+      });
+      created.push(child);
+    }
+    // the other side of the two-way relation (Obsidian doesn't keep it in sync on its own)
+    await this.app.fileManager.processFrontMatter(parent, (fm) => {
+      let list = asList(fm[cfg.subtaskProperty]);
+      for (const c of created) list = this.withLink(list, c, parent);
+      fm[cfg.subtaskProperty] = list;
+    });
+    const open = String(cfg.open === undefined ? (created.length === 1 ? "tab" : "none") : cfg.open).toLowerCase();
+    if (open !== "none" && open !== "false" && created.length) {
+      const leaf = open === "split" ? this.app.workspace.getLeaf("split") : this.app.workspace.getLeaf("tab");
+      await leaf.openFile(created[0], { state: { mode: "source" }, eState: { rename: "all" } });
+    } else {
+      new obsidian.Notice(created.length === 1 ? `Added sub-task "${created[0].basename}"` : `Added ${created.length} sub-tasks`);
+    }
+    return created;
+  }
+
+  // Notion: Completed Tasks += parent, Parent task -= parent, Status = Closed
+  async completeSubtask(cfg, child) {
+    const parents = this.linkedFiles(this.fm(child)[cfg.parentProperty], child);
+    const status = cfg.status === undefined ? "Closed" : cfg.status;
+    await this.app.fileManager.processFrontMatter(child, (fm) => {
+      let done = asList(fm[cfg.completedProperty]);
+      for (const p of parents) done = this.withLink(done, p, child);
+      if (cfg.completedProperty) fm[cfg.completedProperty] = done;
+      let left = asList(fm[cfg.parentProperty]);
+      for (const p of parents) left = this.withoutLink(left, p, child);
+      fm[cfg.parentProperty] = left;
+      if (cfg.statusProperty && status) fm[cfg.statusProperty] = Array.isArray(fm[cfg.statusProperty]) ? [status] : status;
+    });
+    for (const p of parents) {
+      await this.app.fileManager.processFrontMatter(p, (fm) => {
+        fm[cfg.subtaskProperty] = this.withoutLink(fm[cfg.subtaskProperty], child, p);
+        if (cfg.completedProperty) fm[cfg.completedProperty] = this.withLink(fm[cfg.completedProperty], child, p);
+      });
+    }
+    new obsidian.Notice(parents.length ? `Moved to Completed Tasks of "${parents.map((p) => p.basename).join('", "')}"` : `Set to ${status} (no parent task)`);
+  }
+
+  // Notion: Sub-task -= all (the two-way relation clears each child's Parent task)
+  async unparentAll(cfg, parent) {
+    const children = this.linkedFiles(this.fm(parent)[cfg.subtaskProperty], parent);
+    await this.app.fileManager.processFrontMatter(parent, (fm) => { fm[cfg.subtaskProperty] = []; });
+    for (const c of children) {
+      await this.app.fileManager.processFrontMatter(c, (fm) => {
+        fm[cfg.parentProperty] = this.withoutLink(fm[cfg.parentProperty], parent, c);
+      });
+    }
+    new obsidian.Notice(`Un-parented ${children.length} sub-task${children.length === 1 ? "" : "s"}`);
+  }
+
+  // Notion: "Insert blocks above/below button"
+  async insertText(cfg, file, el, ctx) {
+    const text = String(cfg.text || "").replace(/\s+$/, "");
+    if (!text) return;
+    const info = ctx.getSectionInfo(el);
+    const below = String(cfg.position || "above").toLowerCase() === "below";
+    await this.app.vault.process(file, (data) => {
+      const nl = data.includes("\r\n") ? "\r\n" : "\n";
+      const lines = data.split(/\r?\n/);
+      const add = text.split(/\r?\n/);
+      if (!info) return data.replace(/\s*$/, "") + nl + add.join(nl) + nl;
+      const at = below ? info.lineEnd + 1 : info.lineStart;
+      lines.splice(at, 0, ...add);
+      return lines.join(nl);
+    });
+  }
+}
+
 // ---------- Notion-style comments under the properties ----------
 //
 // Comments live in the note body, right after the frontmatter, as callouts:
@@ -2228,6 +2484,9 @@ class NotionStyleKanbanPlugin extends obsidian.Plugin {
     this.viewTabs = new ViewTabsBar(this);
     this.viewTabs.load();
     this.register(() => this.viewTabs.unload());
+
+    this.noteButtons = new NoteButtons(this);
+    this.noteButtons.load();
 
     // "Change icon" on any note's right-click menu (cards, sub-tasks, file explorer, tabs)
     let lastMouse = null;
