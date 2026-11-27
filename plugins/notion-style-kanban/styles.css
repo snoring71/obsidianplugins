@@ -410,3 +410,111 @@
 .nk-view-tab-icon { display: inline-flex; width: 16px; height: 16px; align-items: center; justify-content: center; font-size: 14px; line-height: 1; }
 .nk-view-tab-icon svg { width: 16px; height: 16px; }
 .nk-view-tab-more { color: var(--text-faint); }
+
+/* ---------- Notion-style select / multi-select properties ---------- */
+.nk-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  max-width: 100%;
+  padding: 0 6px;
+  border-radius: 4px;
+  font-size: 13px;
+  line-height: 20px;
+  background: rgba(var(--nk-rgb), 0.35);
+  color: var(--text-normal);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.nk-pill-x { display: inline-flex; margin-left: 2px; opacity: 0.6; cursor: pointer; }
+.nk-pill-x:hover { opacity: 1; }
+.nk-pill-x svg { width: 12px; height: 12px; }
+
+/* in the Properties panel: hide Obsidian's own editor for managed properties */
+.metadata-property.nk-managed .metadata-property-value > :not(.nk-select-value) { display: none !important; }
+.nk-select-value {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  min-height: 30px;
+  width: 100%;
+  padding: 4px 6px;
+  border-radius: var(--radius-s, 4px);
+  cursor: pointer;
+}
+.nk-select-value:hover { background: var(--background-modifier-hover); }
+.nk-select-empty { color: var(--text-faint); font-size: var(--metadata-input-font-size, 14px); }
+
+/* custom property icons */
+.metadata-property-icon.nk-has-icon > svg { display: none; }
+.nk-prop-icon { display: inline-flex; width: var(--icon-s, 16px); height: var(--icon-s, 16px); align-items: center; justify-content: center; font-size: 14px; line-height: 1; }
+.nk-prop-icon svg { width: 100%; height: 100%; }
+
+/* the dropdown */
+.nk-options, .nk-options-menu {
+  position: fixed;
+  z-index: var(--layer-popover, 30);
+  background: var(--background-secondary, #252525);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+  font-size: 14px;
+}
+.nk-options { width: 300px; max-height: 420px; display: flex; flex-direction: column; overflow: hidden; }
+.nk-options-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  padding: 8px 10px;
+  background: var(--background-primary-alt, rgba(255, 255, 255, 0.03));
+  border-bottom: 1px solid var(--background-modifier-border);
+  cursor: text;
+}
+.nk-options-input {
+  flex: 1 1 80px;
+  min-width: 60px;
+  border: none !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  padding: 0 !important;
+  height: 22px;
+  font-size: 14px;
+}
+.nk-options-hint { padding: 8px 12px 4px; font-size: 12px; color: var(--text-muted); }
+.nk-options-list { overflow-y: auto; padding: 2px 4px 6px; }
+.nk-options-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.nk-options-row.is-active { background: var(--background-modifier-hover); }
+.nk-options-row.is-dragging { opacity: 0.4; }
+.nk-options-row.is-drop-target { box-shadow: inset 0 2px 0 var(--interactive-accent); }
+.nk-options-handle { display: inline-flex; color: var(--text-faint); cursor: grab; opacity: 0; }
+.nk-options-row:hover .nk-options-handle { opacity: 1; }
+.nk-options-handle svg, .nk-options-more svg, .nk-options-check svg { width: 14px; height: 14px; }
+.nk-options-check { display: inline-flex; color: var(--text-muted); }
+.nk-options-spacer { flex: 1; }
+.nk-options-more { display: inline-flex; padding: 2px; border-radius: 4px; color: var(--text-muted); opacity: 0; }
+.nk-options-row:hover .nk-options-more, .nk-options-row.is-active .nk-options-more { opacity: 1; }
+.nk-options-more:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
+.nk-options-create { color: var(--text-muted); font-size: 13px; }
+.nk-options-empty { padding: 6px 8px; color: var(--text-faint); font-size: 13px; }
+
+/* the "…" menu on an option */
+.nk-options-menu { width: 220px; padding: 6px 4px; }
+.nk-options-rename { width: calc(100% - 8px); margin: 2px 4px 6px; font-size: 14px; }
+.nk-options-menu-heading { padding: 8px 8px 4px; font-size: 12px; color: var(--text-muted); }
+.nk-options-menu-item { display: flex; align-items: center; gap: 8px; padding: 4px 8px; border-radius: 4px; cursor: pointer; }
+.nk-options-menu-item:hover { background: var(--background-modifier-hover); }
+.nk-options-menu-icon { display: inline-flex; color: var(--text-muted); }
+.nk-options-menu-icon svg, .nk-options-menu-check svg { width: 16px; height: 16px; }
+.nk-options-menu-check { margin-left: auto; display: inline-flex; }
+.nk-options-swatch { width: 18px; height: 18px; border-radius: 4px; background: rgba(var(--nk-rgb), 0.35); box-shadow: inset 0 0 0 1px rgba(var(--nk-rgb), 0.5); }

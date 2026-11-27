@@ -161,6 +161,7 @@ class NotionKanbanView extends obsidian.BasesView {
         if (this.childPaths.has(oldPath)) this.renderSoon();
       })
     );
+    this.registerEvent(this.app.workspace.on("nk:schema-changed", () => this.renderSoon()));
   }
 
   onunload() {
@@ -344,7 +345,7 @@ class NotionKanbanView extends obsidian.BasesView {
     // column headers
     const header = board.createDiv({ cls: "nk-row nk-header-row" });
     columns.forEach((col, ci) => {
-      const rgb = rgbFor(s.columnColors.get(col.toLowerCase()) || "gray");
+      const rgb = rgbFor(this.plugin.schemas.colorOf(s.columnKey, col) || s.columnColors.get(col.toLowerCase()) || "gray");
       const h = header.createDiv({ cls: "nk-col-header" });
       h.style.setProperty("--nk-rgb", rgb);
       const pill = h.createSpan({ cls: "nk-status-pill" });
@@ -365,7 +366,7 @@ class NotionKanbanView extends obsidian.BasesView {
         const caret = lh.createSpan({ cls: "nk-caret" });
         setIconSafe(caret, ["chevron-down"]);
         const lanePill = lh.createSpan({ cls: "nk-lane-pill", text: lane });
-        lanePill.style.setProperty("--nk-rgb", rgbFor(s.laneColors.get(lane.toLowerCase()) || s.tagColors.get(lane.toLowerCase()) || "blue"));
+        lanePill.style.setProperty("--nk-rgb", rgbFor((s.laneKey && this.plugin.schemas.colorOf(s.laneKey, lane)) || s.laneColors.get(lane.toLowerCase()) || s.tagColors.get(lane.toLowerCase()) || "blue"));
         let n = 0;
         columns.forEach((_, ci) => (n += (buckets.get(`${lane}\u0000${ci}`) || []).length));
         lh.createSpan({ cls: "nk-count", text: String(n) });
@@ -374,7 +375,7 @@ class NotionKanbanView extends obsidian.BasesView {
       }
       const row = board.createDiv({ cls: "nk-row" });
       columns.forEach((col, ci) => {
-        const rgb = rgbFor(s.columnColors.get(col.toLowerCase()) || "gray");
+        const rgb = rgbFor(this.plugin.schemas.colorOf(s.columnKey, col) || s.columnColors.get(col.toLowerCase()) || "gray");
         const cell = row.createDiv({ cls: "nk-cell" });
         cell.style.setProperty("--nk-rgb", rgb);
         const list = buckets.get(`${lane}\u0000${ci}`) || [];
@@ -421,7 +422,7 @@ class NotionKanbanView extends obsidian.BasesView {
       const tagRow = card.createDiv({ cls: "nk-tags" });
       for (const t of tags) {
         const p = tagRow.createSpan({ cls: "nk-tag", text: t });
-        p.style.setProperty("--nk-rgb", rgbFor(s.tagColors.get(t.toLowerCase()) || hashColor(t.toLowerCase())));
+        p.style.setProperty("--nk-rgb", rgbFor(this.plugin.schemas.colorOf(s.tagKey, t) || s.tagColors.get(t.toLowerCase()) || hashColor(t.toLowerCase())));
       }
     }
 
@@ -1084,6 +1085,602 @@ class NoteIconHeader {
   }
 }
 
+// ---------- Notion-style property options (select / multi-select) ----------
+
+const OPTION_COLORS = ["default", "gray", "brown", "orange", "yellow", "green", "blue", "purple", "pink", "red"];
+const COLOR_LABELS = {
+  default: "Default", gray: "Gray", brown: "Brown", orange: "Orange", yellow: "Yellow",
+  green: "Green", blue: "Blue", purple: "Purple", pink: "Pink", red: "Red",
+};
+
+function sameText(a, b) {
+  return String(a).toLowerCase() === String(b).toLowerCase();
+}
+
+// Option lists, colors and icons for properties, shared by every note and board in the vault.
+// Stored in data.json as settings.properties = { Tag: { type: "multi", options: [{ name, color }] } }
+// and settings.propertyIcons = { Tag: "tag:gray" }.
+class PropertySchemas {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.app = plugin.app;
+  }
+
+  get all() {
+    const s = this.plugin.settings;
+    if (!s.properties || typeof s.properties !== "object") s.properties = {};
+    return s.properties;
+  }
+
+  get icons() {
+    const s = this.plugin.settings;
+    if (!s.propertyIcons || typeof s.propertyIcons !== "object") s.propertyIcons = {};
+    return s.propertyIcons;
+  }
+
+  keyOf(name) {
+    if (!name) return null;
+    if (this.all[name]) return name;
+    return Object.keys(this.all).find((k) => sameText(k, name)) || null;
+  }
+
+  find(name) {
+    const k = this.keyOf(name);
+    return k ? this.all[k] : null;
+  }
+
+  isManaged(name) {
+    const p = this.find(name);
+    return !!(p && (p.type === "select" || p.type === "multi"));
+  }
+
+  option(prop, value) {
+    const p = this.find(prop);
+    return p && Array.isArray(p.options) ? p.options.find((o) => sameText(o.name, value)) || null : null;
+  }
+
+  colorOf(prop, value) {
+    const o = prop ? this.option(prop, value) : null;
+    return o ? o.color || "default" : null;
+  }
+
+  iconOf(prop) {
+    if (!prop) return "";
+    const k = Object.keys(this.icons).find((n) => sameText(n, prop));
+    return k ? this.icons[k] : "";
+  }
+
+  async setIcon(prop, value) {
+    const k = Object.keys(this.icons).find((n) => sameText(n, prop)) || prop;
+    if (value) this.icons[k] = value;
+    else delete this.icons[k];
+    await this.save();
+  }
+
+  // Turn a property into a select / multi-select, seeding options from values already in the vault.
+  async manage(prop, type) {
+    const k = this.keyOf(prop) || prop;
+    const existing = this.all[k];
+    if (existing) existing.type = type;
+    else {
+      const options = [];
+      for (const v of this.valuesInVault(prop)) options.push({ name: v, color: OPTION_COLORS[(options.length % 9) + 1] });
+      this.all[k] = { type, options };
+    }
+    await this.save();
+  }
+
+  async unmanage(prop) {
+    const k = this.keyOf(prop);
+    if (k) delete this.all[k];
+    await this.save();
+  }
+
+  addOption(prop, name, color) {
+    const p = this.find(prop);
+    if (!p) return null;
+    if (!Array.isArray(p.options)) p.options = [];
+    let o = p.options.find((x) => sameText(x.name, name));
+    if (!o) {
+      o = { name: String(name), color: color || OPTION_COLORS[1 + Math.floor(Math.random() * 9)] };
+      p.options.push(o);
+    }
+    return o;
+  }
+
+  async save() {
+    await this.plugin.saveData(this.plugin.settings);
+    this.plugin.schemaChanged();
+  }
+
+  // frontmatter key on a note that matches `prop` (property names are case-insensitive in Obsidian)
+  fmKey(fm, prop) {
+    if (!fm) return null;
+    if (prop in fm) return prop;
+    return Object.keys(fm).find((k) => sameText(k, prop)) || null;
+  }
+
+  *notesWith(prop) {
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      const fm = (this.app.metadataCache.getFileCache(file) || {}).frontmatter;
+      const k = this.fmKey(fm, prop);
+      if (k) yield { file, key: k, values: asList(fm[k]).map(asString).filter(Boolean) };
+    }
+  }
+
+  valuesInVault(prop) {
+    const seen = new Map();
+    for (const n of this.notesWith(prop)) for (const v of n.values) if (!seen.has(v.toLowerCase())) seen.set(v.toLowerCase(), v);
+    return [...seen.values()].sort((a, b) => a.localeCompare(b));
+  }
+
+  usage(prop, name) {
+    let n = 0;
+    for (const x of this.notesWith(prop)) if (x.values.some((v) => sameText(v, name))) n++;
+    return n;
+  }
+
+  // Rename (newName) or remove (newName === null) a value on every note that has it.
+  async rewriteValue(prop, oldName, newName) {
+    const targets = [...this.notesWith(prop)].filter((x) => x.values.some((v) => sameText(v, oldName)));
+    for (const t of targets) {
+      await this.app.fileManager.processFrontMatter(t.file, (fm) => {
+        const k = this.fmKey(fm, prop);
+        if (!k) return;
+        const cur = fm[k];
+        if (Array.isArray(cur)) {
+          const out = [];
+          for (const v of cur) {
+            if (sameText(asString(v), oldName)) {
+              if (newName !== null && !out.some((x) => sameText(x, newName))) out.push(newName);
+            } else out.push(v);
+          }
+          fm[k] = out;
+        } else if (sameText(asString(cur), oldName)) {
+          fm[k] = newName === null ? "" : newName;
+        }
+      });
+    }
+    return targets.length;
+  }
+
+  async renameOption(prop, oldName, newName) {
+    newName = String(newName).trim();
+    const o = this.option(prop, oldName);
+    if (!o || !newName || newName === o.name) return 0;
+    const dup = this.option(prop, newName);
+    const p = this.find(prop);
+    if (dup && dup !== o) p.options = p.options.filter((x) => x !== o); // merging into an existing option
+    else o.name = newName;
+    await this.save();
+    return this.rewriteValue(prop, oldName, dup && dup !== o ? dup.name : newName);
+  }
+
+  async deleteOption(prop, name) {
+    const p = this.find(prop);
+    if (!p) return 0;
+    p.options = (p.options || []).filter((o) => !sameText(o.name, name));
+    await this.save();
+    return this.rewriteValue(prop, name, null);
+  }
+}
+
+class ConfirmModal extends obsidian.Modal {
+  constructor(app, title, body, cta, onConfirm) {
+    super(app);
+    this.titleText = title;
+    this.bodyText = body;
+    this.cta = cta;
+    this.onConfirm = onConfirm;
+  }
+  onOpen() {
+    this.titleEl.setText(this.titleText);
+    this.contentEl.createEl("p", { text: this.bodyText });
+    const row = this.contentEl.createDiv({ cls: "modal-button-container" });
+    const ok = row.createEl("button", { cls: "mod-warning", text: this.cta });
+    ok.onclick = () => { this.close(); this.onConfirm(); };
+    const cancel = row.createEl("button", { text: "Cancel" });
+    cancel.onclick = () => this.close();
+  }
+  onClose() { this.contentEl.empty(); }
+}
+
+function renderOptionPill(parent, name, color, extraCls) {
+  const pill = parent.createSpan({ cls: "nk-pill" + (extraCls ? " " + extraCls : ""), text: name });
+  pill.style.setProperty("--nk-rgb", rgbFor(color || "default"));
+  return pill;
+}
+
+// The dropdown you get when clicking a select / multi-select property, like Notion's.
+class OptionsPopover {
+  constructor(plugin, file, prop, anchorEl) {
+    this.plugin = plugin;
+    this.app = plugin.app;
+    this.schemas = plugin.schemas;
+    this.file = file;
+    this.prop = prop;
+    this.anchorEl = anchorEl;
+    this.query = "";
+    this.active = 0;
+    this.menu = null;
+  }
+
+  get schema() { return this.schemas.find(this.prop) || { type: "multi", options: [] }; }
+  get multi() { return this.schema.type === "multi"; }
+
+  readValues() {
+    const fm = (this.app.metadataCache.getFileCache(this.file) || {}).frontmatter || {};
+    const k = this.schemas.fmKey(fm, this.prop);
+    return k ? asList(fm[k]).map(asString).filter(Boolean) : [];
+  }
+
+  async writeValues(values) {
+    await this.app.fileManager.processFrontMatter(this.file, (fm) => {
+      const k = this.schemas.fmKey(fm, this.prop) || this.prop;
+      const wasList = Array.isArray(fm[k]);
+      if (this.multi) fm[k] = values;
+      else if (!values.length) fm[k] = wasList ? [] : "";
+      else fm[k] = wasList ? [values[0]] : values[0];
+    });
+    this.values = values;
+    this.render();
+  }
+
+  open() {
+    this.values = this.readValues();
+    const el = (this.el = document.body.createDiv({ cls: "nk-options" }));
+    this.top = el.createDiv({ cls: "nk-options-top" });
+    this.hint = el.createDiv({ cls: "nk-options-hint" });
+    this.list = el.createDiv({ cls: "nk-options-list" });
+
+    this.onDocDown = (ev) => {
+      if (el.contains(ev.target) || (this.menu && this.menu.contains(ev.target)) || ev.target.closest(".modal-container, .menu")) return;
+      this.close();
+    };
+    this.onKey = (ev) => this.handleKey(ev);
+    window.setTimeout(() => {
+      document.addEventListener("mousedown", this.onDocDown, true);
+      document.addEventListener("keydown", this.onKey, true);
+    }, 0);
+    this.render();
+    this.position();
+    this.input.focus();
+  }
+
+  position() {
+    const el = this.el;
+    const pad = 8, w = 300;
+    const h = Math.min(el.offsetHeight || 360, 420);
+    const r = this.anchorEl && this.anchorEl.isConnected ? this.anchorEl.getBoundingClientRect() : null;
+    let x = r ? r.left : (window.innerWidth - w) / 2;
+    let y = r ? r.top : window.innerHeight / 3;
+    x = Math.max(pad, Math.min(x, window.innerWidth - w - pad));
+    if (y + h > window.innerHeight - pad) y = Math.max(pad, window.innerHeight - h - pad);
+    el.style.left = `${x}px`;
+    el.style.top = `${y}px`;
+  }
+
+  close() {
+    this.closeMenu();
+    document.removeEventListener("mousedown", this.onDocDown, true);
+    document.removeEventListener("keydown", this.onKey, true);
+    if (this.el) this.el.remove();
+    this.el = null;
+    if (this.plugin.activeOptions === this) this.plugin.activeOptions = null;
+  }
+
+  // rows the keyboard can move through: matching options, then "Create …"
+  rows() {
+    const q = this.query.trim();
+    const opts = (this.schema.options || []).filter((o) => !q || o.name.toLowerCase().includes(q.toLowerCase()));
+    const rows = opts.map((o) => ({ kind: "option", option: o }));
+    if (q && !(this.schema.options || []).some((o) => sameText(o.name, q))) rows.push({ kind: "create", name: q });
+    return rows;
+  }
+
+  render() {
+    if (!this.el) return;
+    const colorOf = (v) => this.schemas.colorOf(this.prop, v) || "default";
+
+    // selected values + search box
+    const hadFocus = this.input && document.activeElement === this.input;
+    this.top.empty();
+    for (const v of this.values) {
+      const pill = renderOptionPill(this.top, v, colorOf(v), "is-removable");
+      const x = pill.createSpan({ cls: "nk-pill-x", attr: { "aria-label": "Remove" } });
+      setIconSafe(x, ["x"]);
+      x.onclick = (ev) => { ev.stopPropagation(); this.writeValues(this.values.filter((y) => y !== v)); };
+    }
+    this.input = this.top.createEl("input", {
+      cls: "nk-options-input",
+      attr: { type: "text", placeholder: this.values.length ? "" : "Search for an option…", spellcheck: "false" },
+    });
+    this.input.value = this.query;
+    this.input.oninput = () => { this.query = this.input.value; this.active = 0; this.renderList(); };
+    this.top.onclick = () => this.input.focus();
+    if (hadFocus) this.input.focus();
+
+    this.hint.setText(this.multi ? "Select options or create one" : "Select an option or create one");
+    this.renderList();
+  }
+
+  renderList() {
+    this.list.empty();
+    const rows = this.rows();
+    if (this.active >= rows.length) this.active = Math.max(0, rows.length - 1);
+    rows.forEach((row, i) => {
+      const r = this.list.createDiv({ cls: "nk-options-row" + (i === this.active ? " is-active" : "") });
+      r.onmouseenter = () => { this.active = i; this.list.querySelectorAll(".nk-options-row").forEach((e, j) => e.toggleClass("is-active", j === i)); };
+      r.onclick = () => this.choose(row);
+      if (row.kind === "create") {
+        r.createSpan({ cls: "nk-options-create", text: "Create" });
+        renderOptionPill(r, row.name, "default");
+        return;
+      }
+      const o = row.option;
+      const handle = r.createSpan({ cls: "nk-options-handle", attr: { draggable: "true", "aria-label": "Drag to reorder" } });
+      setIconSafe(handle, ["grip-vertical"]);
+      renderOptionPill(r, o.name, o.color);
+      if (this.values.some((v) => sameText(v, o.name))) {
+        const chk = r.createSpan({ cls: "nk-options-check" });
+        setIconSafe(chk, ["check"]);
+      }
+      r.createSpan({ cls: "nk-options-spacer" });
+      const more = r.createSpan({ cls: "nk-options-more", attr: { "aria-label": "Edit option" } });
+      setIconSafe(more, ["more-horizontal", "ellipsis"]);
+      more.onclick = (ev) => { ev.stopPropagation(); this.openMenu(o, more); };
+
+      // drag to reorder (only meaningful when the list isn't filtered)
+      handle.addEventListener("dragstart", (ev) => { this.dragName = o.name; ev.dataTransfer.effectAllowed = "move"; ev.dataTransfer.setData("text/plain", o.name); r.addClass("is-dragging"); });
+      handle.addEventListener("dragend", () => { this.dragName = null; r.removeClass("is-dragging"); });
+      r.addEventListener("dragover", (ev) => { if (this.dragName) { ev.preventDefault(); r.addClass("is-drop-target"); } });
+      r.addEventListener("dragleave", () => r.removeClass("is-drop-target"));
+      r.addEventListener("drop", async (ev) => {
+        ev.preventDefault();
+        r.removeClass("is-drop-target");
+        const from = this.dragName;
+        this.dragName = null;
+        if (!from || sameText(from, o.name)) return;
+        const opts = this.schema.options;
+        const fi = opts.findIndex((x) => sameText(x.name, from));
+        if (fi < 0) return;
+        const [moved] = opts.splice(fi, 1);
+        const ti = opts.findIndex((x) => sameText(x.name, o.name));
+        const rect = r.getBoundingClientRect();
+        opts.splice(ev.clientY > rect.top + rect.height / 2 ? ti + 1 : ti, 0, moved);
+        await this.schemas.save();
+        this.renderList();
+      });
+    });
+    if (!rows.length) this.list.createDiv({ cls: "nk-options-empty", text: "No options yet. Type to create one." });
+  }
+
+  async choose(row) {
+    let name;
+    if (row.kind === "create") {
+      const o = this.schemas.addOption(this.prop, row.name.trim());
+      await this.schemas.save();
+      name = o.name;
+    } else name = row.option.name;
+    this.query = "";
+    if (this.input) this.input.value = "";
+    const has = this.values.some((v) => sameText(v, name));
+    if (this.multi) await this.writeValues(has ? this.values.filter((v) => !sameText(v, name)) : [...this.values, name]);
+    else {
+      await this.writeValues(has ? [] : [name]);
+      this.close();
+    }
+  }
+
+  handleKey(ev) {
+    if (!this.el) return;
+    if (this.menu) {
+      if (ev.key === "Escape") { ev.preventDefault(); ev.stopPropagation(); this.closeMenu(); }
+      return;
+    }
+    if (document.activeElement !== this.input && ev.key !== "Escape") return;
+    const rows = this.rows();
+    if (ev.key === "Escape") { ev.preventDefault(); ev.stopPropagation(); this.close(); }
+    else if (ev.key === "ArrowDown") { ev.preventDefault(); this.active = Math.min(rows.length - 1, this.active + 1); this.renderList(); }
+    else if (ev.key === "ArrowUp") { ev.preventDefault(); this.active = Math.max(0, this.active - 1); this.renderList(); }
+    else if (ev.key === "Enter") { ev.preventDefault(); if (rows[this.active]) this.choose(rows[this.active]); }
+    else if (ev.key === "Backspace" && !this.input.value && this.values.length) {
+      ev.preventDefault();
+      this.writeValues(this.values.slice(0, -1));
+    }
+  }
+
+  // "…" menu on an option: rename, delete, color
+  openMenu(option, anchor) {
+    this.closeMenu();
+    const m = (this.menu = document.body.createDiv({ cls: "nk-options-menu" }));
+    const input = m.createEl("input", { cls: "nk-options-rename", attr: { type: "text", spellcheck: "false" } });
+    input.value = option.name;
+    const commitRename = async () => {
+      const next = input.value.trim();
+      if (!next || next === option.name) return;
+      const old = option.name;
+      const n = await this.schemas.renameOption(this.prop, old, next);
+      this.values = this.values.map((v) => (sameText(v, old) ? next : v));
+      if (n) new obsidian.Notice(`Renamed "${old}" to "${next}" on ${n} note${n === 1 ? "" : "s"}.`);
+      this.render();
+    };
+    input.onkeydown = (ev) => { if (ev.key === "Enter") { ev.preventDefault(); commitRename().then(() => this.closeMenu()); } };
+    input.onblur = () => commitRename();
+
+    const del = m.createDiv({ cls: "nk-options-menu-item" });
+    setIconSafe(del.createSpan({ cls: "nk-options-menu-icon" }), ["trash-2", "trash"]);
+    del.createSpan({ text: "Delete" });
+    del.onclick = () => {
+      const n = this.schemas.usage(this.prop, option.name);
+      this.closeMenu();
+      const run = async () => {
+        const changed = await this.schemas.deleteOption(this.prop, option.name);
+        this.values = this.values.filter((v) => !sameText(v, option.name));
+        if (changed) new obsidian.Notice(`Removed "${option.name}" from ${changed} note${changed === 1 ? "" : "s"}.`);
+        this.render();
+      };
+      if (!n) run();
+      else new ConfirmModal(this.app, `Delete "${option.name}"?`, `This option will be removed from ${n} note${n === 1 ? "" : "s"}.`, "Delete", run).open();
+    };
+
+    m.createDiv({ cls: "nk-options-menu-heading", text: "Colors" });
+    for (const c of OPTION_COLORS) {
+      const row = m.createDiv({ cls: "nk-options-menu-item" });
+      const sw = row.createSpan({ cls: "nk-options-swatch" });
+      sw.style.setProperty("--nk-rgb", rgbFor(c));
+      row.createSpan({ text: COLOR_LABELS[c] });
+      if ((option.color || "default") === c) setIconSafe(row.createSpan({ cls: "nk-options-menu-check" }), ["check"]);
+      row.onclick = async () => {
+        option.color = c;
+        await this.schemas.save();
+        this.closeMenu();
+        this.render();
+      };
+    }
+
+    const r = anchor.getBoundingClientRect();
+    const w = 220, pad = 8;
+    let x = r.right + 6, y = r.top - 8;
+    if (x + w > window.innerWidth - pad) x = Math.max(pad, r.left - w - 6);
+    m.style.left = `${x}px`;
+    m.style.top = `${y}px`;
+    const h = m.offsetHeight;
+    if (y + h > window.innerHeight - pad) m.style.top = `${Math.max(pad, window.innerHeight - h - pad)}px`;
+    input.focus();
+    input.select();
+  }
+
+  closeMenu() {
+    if (this.menu) this.menu.remove();
+    this.menu = null;
+  }
+}
+
+// Decorates Obsidian's Properties panel: colored pills + Notion dropdown for select properties,
+// and custom icons for any property.
+class PropertyPanel {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.app = plugin.app;
+    this.schemas = plugin.schemas;
+    this.refreshSoon = obsidian.debounce(() => this.refreshAll(), 40, true);
+  }
+
+  load() {
+    const p = this.plugin;
+    p.registerEvent(this.app.workspace.on("layout-change", () => this.refreshSoon()));
+    p.registerEvent(this.app.workspace.on("file-open", () => this.refreshSoon()));
+    p.registerEvent(this.app.workspace.on("active-leaf-change", () => this.refreshSoon()));
+    p.registerEvent(this.app.metadataCache.on("changed", () => this.refreshSoon()));
+    p.registerEvent(this.app.workspace.on("nk:schema-changed", () => this.refreshSoon()));
+    // The properties list re-renders when you edit it; re-apply then.
+    this.observer = new MutationObserver(() => this.refreshSoon());
+    // Right-click a property's icon to give it a custom icon.
+    p.registerDomEvent(document, "contextmenu", (ev) => {
+      const iconEl = ev.target.closest && ev.target.closest(".metadata-property-icon");
+      if (!iconEl) return;
+      const propEl = iconEl.closest(".metadata-property[data-property-key]");
+      if (!propEl) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      this.propertyMenu(propEl.dataset.propertyKey, iconEl, ev);
+    }, true);
+    this.app.workspace.onLayoutReady(() => this.refreshAll());
+  }
+
+  unload() {
+    if (this.observer) this.observer.disconnect();
+    document.querySelectorAll(".nk-select-value, .nk-prop-icon").forEach((e) => e.remove());
+    document.querySelectorAll(".nk-managed, .nk-has-icon").forEach((e) => e.removeClass("nk-managed", "nk-has-icon"));
+  }
+
+  propertyMenu(prop, iconEl, ev) {
+    const menu = new obsidian.Menu();
+    menu.addItem((i) => i.setTitle("Change icon").setIcon("smile-plus").onClick(() => this.pickIcon(prop, iconEl)));
+    if (this.schemas.iconOf(prop)) menu.addItem((i) => i.setTitle("Remove icon").setIcon("x").onClick(() => this.schemas.setIcon(prop, null)));
+    menu.addSeparator();
+    const cur = this.schemas.find(prop);
+    const kind = cur ? cur.type : "";
+    menu.addItem((i) => i.setTitle("Notion-style select").setChecked(kind === "select").onClick(() => this.schemas.manage(prop, "select")));
+    menu.addItem((i) => i.setTitle("Notion-style multi-select").setChecked(kind === "multi").onClick(() => this.schemas.manage(prop, "multi")));
+    if (cur) menu.addItem((i) => i.setTitle("Plain Obsidian property").setChecked(false).onClick(() => this.schemas.unmanage(prop)));
+    menu.showAtMouseEvent(ev);
+  }
+
+  pickIcon(prop, anchorEl) {
+    this.plugin.openIconPicker({
+      current: this.schemas.iconOf(prop),
+      write: (value) => this.schemas.setIcon(prop, value),
+    }, "icon", anchorEl);
+  }
+
+  refreshAll() {
+    if (this.observer) this.observer.disconnect();
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const view = leaf.view;
+      if (!view || !view.file || !view.containerEl) continue;
+      view.containerEl.querySelectorAll(".metadata-property[data-property-key]").forEach((el) => this.decorate(el, view.file));
+      if (this.observer) view.containerEl.querySelectorAll(".metadata-properties").forEach((h) => this.observer.observe(h, { childList: true, subtree: true }));
+    }
+  }
+
+  decorate(propEl, file) {
+    const prop = propEl.dataset.propertyKey;
+    if (!prop) return;
+
+    // icon
+    const iconBox = propEl.querySelector(".metadata-property-icon");
+    const iconVal = this.schemas.iconOf(prop);
+    if (iconBox) {
+      let mine = iconBox.querySelector(":scope > .nk-prop-icon");
+      if (iconVal) {
+        if (!mine || mine.dataset.value !== iconVal) {
+          if (mine) mine.remove();
+          mine = iconBox.createSpan({ cls: "nk-prop-icon" });
+          mine.dataset.value = iconVal;
+          renderIconValue(mine, iconVal);
+        }
+        if (!iconBox.hasClass("nk-has-icon")) iconBox.addClass("nk-has-icon");
+      } else {
+        if (mine) mine.remove();
+        if (iconBox.hasClass("nk-has-icon")) iconBox.removeClass("nk-has-icon");
+      }
+    }
+
+    // select / multi-select values
+    const valueEl = propEl.querySelector(".metadata-property-value");
+    if (!valueEl) return;
+    let box = valueEl.querySelector(":scope > .nk-select-value");
+    if (!this.schemas.isManaged(prop)) {
+      if (box) box.remove();
+      if (propEl.hasClass("nk-managed")) propEl.removeClass("nk-managed");
+      return;
+    }
+    const fm = (this.app.metadataCache.getFileCache(file) || {}).frontmatter || {};
+    const k = this.schemas.fmKey(fm, prop);
+    const values = k ? asList(fm[k]).map(asString).filter(Boolean) : [];
+    const sig = JSON.stringify([file.path, values, values.map((v) => this.schemas.colorOf(prop, v))]);
+    if (!propEl.hasClass("nk-managed")) propEl.addClass("nk-managed");
+    if (box && box.dataset.sig === sig) return;
+    if (!box) {
+      box = valueEl.createDiv({ cls: "nk-select-value" });
+      box.onclick = (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const f = this.app.vault.getFileByPath(box.dataset.path);
+        if (f) this.plugin.openOptions(f, box.dataset.prop, box);
+      };
+    }
+    box.dataset.sig = sig;
+    box.dataset.path = file.path;
+    box.dataset.prop = prop;
+    box.empty();
+    for (const v of values) renderOptionPill(box, v, this.schemas.colorOf(prop, v) || "default");
+    if (!values.length) box.createSpan({ cls: "nk-select-empty", text: "Empty" });
+  }
+}
+
 // ---------- Notion-style view tabs above every base ----------
 
 const VIEW_TYPE_ICONS = { table: "table", cards: "layout-grid", list: "list", kanban: "square-kanban", "notion-kanban": "square-kanban", map: "map" };
@@ -1231,6 +1828,16 @@ class ViewTabsBar {
 }
 
 class NotionStyleKanbanPlugin extends obsidian.Plugin {
+  openOptions(file, prop, anchorEl) {
+    if (this.activeOptions) this.activeOptions.close();
+    this.activeOptions = new OptionsPopover(this, file, prop, anchorEl);
+    this.activeOptions.open();
+  }
+
+  schemaChanged() {
+    this.app.workspace.trigger("nk:schema-changed");
+  }
+
   openIconPicker(file, iconKey, anchorEl, pos) {
     if (this.activePicker) this.activePicker.close();
     this.activePicker = new IconPicker(this, file, iconKey || "icon", anchorEl, pos);
@@ -1241,12 +1848,18 @@ class NotionStyleKanbanPlugin extends obsidian.Plugin {
     const fresh = (await this.loadData()) || {};
     Object.assign(this.settings, fresh);
     if (this.viewTabs) this.viewTabs.refreshAll();
+    this.schemaChanged();
   }
 
   async onload() {
     this.settings = Object.assign({ recentIcons: [], savedIcons: [], pickerTab: null }, (await this.loadData()) || {});
     this.settings.recentIcons = this.settings.recentIcons.slice(0, RECENT_LIMIT);
     this.registerHoverLinkSource(HOVER_SOURCE, { display: "Notion-style Kanban", defaultMod: true });
+
+    this.schemas = new PropertySchemas(this);
+    this.propertyPanel = new PropertyPanel(this);
+    this.propertyPanel.load();
+    this.register(() => this.propertyPanel.unload());
 
     this.noteIcons = new NoteIconHeader(this);
     this.noteIcons.load();
