@@ -4,6 +4,7 @@ Task Board Item: []
 Related: []
 Topic: 1-1 Meeting
 icon: "icons/document_pink"
+Date: "{{now:YYYY-MM-DDTHH:mm}}"
 Created: "{{now}}"
 title: "1-1 Meeting"
 ---
