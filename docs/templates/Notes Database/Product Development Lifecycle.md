@@ -4,6 +4,7 @@ Task Board Item: []
 Related: []
 Topic: Product Development Lifecycle
 icon: "icons/document_purple"
+Date: "{{now:YYYY-MM-DDTHH:mm}}"
 Created: "{{now}}"
 title: "Product Development Lifecycle"
 ---

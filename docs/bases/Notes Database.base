@@ -1,0 +1,59 @@
+filters:
+  and:
+    - note["base"] == link("Notes Database.base")
+    - not:
+        - file.inFolder("Templates")
+formulas:
+  Name: file.asLink(if(note.title, note.title, file.name))
+properties:
+  formula.Name:
+    displayName: Name
+  file.name:
+    displayName: File name
+  Status:
+    displayName: Status
+  Sub-topic:
+    displayName: Sub-topic
+  Last edited by:
+    displayName: Last edited by
+  Task Board Item:
+    displayName: Task Board Item
+  Related:
+    displayName: Related
+  Date:
+    displayName: Date
+  Created:
+    displayName: Created
+  Topic:
+    displayName: Topic
+views:
+  - type: table
+    name: All
+    groupBy:
+      property: Status
+      direction: DESC
+    groupOrder:
+      - Needs work
+      - Future
+      - Closed
+    order:
+      - formula.Name
+      - Topic
+      - Sub-topic
+      - Status
+      - Date
+      - Created
+      - Task Board Item
+      - Related
+    sort:
+      - property: Date
+        direction: DESC
+    columnSize:
+      formula.Name: 524
+      note.Topic: 174
+      note.Sub-topic: 151
+      note.Status: 130
+      note.Date: 200
+      note.Created: 200
+      note.Task Board Item: 200
+      note.Related: 200

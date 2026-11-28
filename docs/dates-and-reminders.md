@@ -44,6 +44,10 @@ The command **Convert imported Notion dates to @ dates** turns dates the Notion 
   for sync, using the same delay as repeating templates (15 seconds by default).
 - Reminders that were already due before 0.18.0 was installed are skipped (`remindersSince` in data.json).
 
+## Phone notifications
+
+To get reminders on your phone while Obsidian is closed, set up the Cloudflare worker and the ntfy app. See [reminder-push-setup.md](reminder-push-setup.md). The plugin sends the worker its upcoming reminders whenever they change.
+
 ## Inbox
 
 Open it from the inbox icon in the ribbon, which shows the unread count, or with the command "Open inbox".

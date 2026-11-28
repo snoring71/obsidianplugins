@@ -4,6 +4,7 @@ Task Board Item: []
 Related: []
 Topic: SPR Review & Approval
 icon: "icons/window_blue"
+Date: "{{now:YYYY-MM-DDTHH:mm}}"
 Created: "{{now}}"
 title: "SPR Review & Approval"
 ---
