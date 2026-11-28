@@ -4,6 +4,7 @@ Task Board Item: []
 Related: []
 Topic: Card Processing Alignment
 icon: "icons/credit-card_green"
+Date: "{{now:YYYY-MM-DDTHH:mm}}"
 Created: "{{now}}"
 title: "Card Processing Alignment"
 ---
