@@ -5552,7 +5552,7 @@ class ReminderCenter {
       await this.scanAll();
       const v = Number(this.settings.repeatDelaySeconds);
       const delay = (isNaN(v) ? 15 : Math.max(0, v)) * 1000;
-      this.startTimer = window.setTimeout(() => { this.ready = true; this.check(); }, delay);
+      this.startTimer = window.setTimeout(() => { this.ready = true; this.check(); if (this.plugin.push) this.plugin.push.soon(); }, delay);
       this.updateBadge();
     });
   }
@@ -5731,6 +5731,116 @@ class ReminderCenter {
   }
 }
 
+
+// ---------- phone pushes through a Cloudflare worker + ntfy (cloudflare/reminder-push/worker.js) ----------
+
+function randomToken(n) {
+  const chars = "abcdefghijkmnpqrstuvwxyz23456789";
+  const bytes = new Uint8Array(n);
+  (window.crypto || crypto).getRandomValues(bytes);
+  return Array.from(bytes, (b) => chars[b % chars.length]).join("");
+}
+
+function hashString(str) {
+  // FNV-1a, twice with different seeds -> 16 hex chars; keeps note text out of the ids we send
+  let h1 = 0x811c9dc5, h2 = 0x01000193 ^ 0x5bd1e995;
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ c, 0x01000193 + 2) >>> 0;
+  }
+  return h1.toString(16).padStart(8, "0") + h2.toString(16).padStart(8, "0");
+}
+
+class ReminderPush {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.app = plugin.app;
+    this.lastResult = "";
+  }
+
+  get s() { return this.plugin.settings; }
+  enabled() { return !!(this.s.pushUrl && this.s.pushKey); }
+  base() { return String(this.s.pushUrl || "").trim().replace(/\/+$/, ""); }
+
+  load() {
+    // re-send now and then in case the worker lost its copy
+    this.plugin.registerInterval(window.setInterval(() => this.sync(true), 6 * 60 * 60 * 1000));
+  }
+
+  unload() { if (this.timer) window.clearTimeout(this.timer); }
+
+  soon() {
+    if (!this.enabled() || !this.plugin.reminders || !this.plugin.reminders.ready) return;
+    if (this.timer) window.clearTimeout(this.timer);
+    this.timer = window.setTimeout(() => this.sync(false), 5000);
+  }
+
+  payload() {
+    const now = Date.now();
+    const horizon = now + 400 * 864e5;
+    const vault = encodeURIComponent(this.app.vault.getName());
+    const titles = this.s.pushTitles !== false;
+    return this.plugin.reminders.all()
+      .filter((r) => r.fireAt > now - 5 * 60 * 1000 && r.fireAt < horizon)
+      .sort((a, b) => a.fireAt - b.fireAt)
+      .slice(0, 1000)
+      .map((r) => {
+        const id = hashString(r.id);
+        if (!titles) return { id, fireAt: r.fireAt, title: "Reminder", text: "Open Obsidian to see it.", click: `obsidian://open?vault=${vault}` };
+        const file = this.app.vault.getFileByPath(r.path);
+        return {
+          id,
+          fireAt: r.fireAt,
+          title: file ? displayTitle(file, this.app) : "Reminder",
+          text: r.kind === "property" ? r.prop : (r.text || "Reminder"),
+          click: `obsidian://open?vault=${vault}&file=${encodeURIComponent(r.path)}`,
+        };
+      });
+  }
+
+  async call(path, body) {
+    const res = await obsidian.requestUrl({
+      url: this.base() + path,
+      method: "POST",
+      headers: { Authorization: "Bearer " + String(this.s.pushKey || "").trim(), "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+      throw: false,
+    });
+    let data = {};
+    try { data = res.json || JSON.parse(res.text); } catch (e) { data = { error: res.text }; }
+    if (res.status !== 200 || !data.ok) throw new Error((data && data.error) || "HTTP " + res.status);
+    return data;
+  }
+
+  async sync(force) {
+    if (!this.enabled()) return null;
+    if (!force && !(this.plugin.reminders && this.plugin.reminders.ready)) return null;
+    const reminders = this.payload();
+    const body = JSON.stringify(reminders);
+    const key = "nk-push-hash";
+    const hash = hashString(this.base() + body);
+    let last = null;
+    try { last = window.localStorage.getItem(key); } catch (e) { /* no storage */ }
+    if (!force && last === hash) return null;
+    try {
+      const r = await this.call("/sync", { reminders });
+      try { window.localStorage.setItem(key, hash); } catch (e) { /* no storage */ }
+      this.lastResult = `Sent ${r.upcoming} upcoming reminder${r.upcoming === 1 ? "" : "s"} · ${obsidian.moment().format("h:mm A")}`;
+      return r;
+    } catch (e) {
+      this.lastResult = "Couldn't reach the worker: " + e.message;
+      console.warn("Notion-style Kanban: reminder push sync failed", e);
+      if (force) throw e;
+      return null;
+    }
+  }
+
+  async test() {
+    await this.call("/test", {});
+  }
+}
+
 class InboxView extends obsidian.ItemView {
   constructor(leaf, plugin) {
     super(leaf);
@@ -5889,6 +5999,35 @@ class CommentSettingTab extends obsidian.PluginSettingTab {
         });
         t.inputEl.rows = 3;
       });
+
+    new obsidian.Setting(containerEl).setName("Phone notifications").setHeading();
+    containerEl.createEl("p", { cls: "setting-item-description", text: "Reminders reach your phone through a small Cloudflare worker and the ntfy app, even when Obsidian is closed. Setup steps: docs/reminder-push-setup.md in the plugin repo." });
+    const push = this.plugin.push;
+    const textWithGenerate = (name, desc, key, len, prefix) => {
+      new obsidian.Setting(containerEl).setName(name).setDesc(desc)
+        .addText((t) => {
+          t.setValue(st[key] || "").onChange((v) => { st[key] = v.trim(); save(); });
+          t.inputEl.style.width = "220px";
+        })
+        .addExtraButton((b) => b.setIcon("copy").setTooltip("Copy").onClick(() => { navigator.clipboard.writeText(st[key] || ""); new obsidian.Notice("Copied."); }))
+        .addExtraButton((b) => b.setIcon("refresh-cw").setTooltip("Make a new one").onClick(async () => { st[key] = prefix + randomToken(len); await save(); this.display(); }));
+    };
+    textWithGenerate("ntfy topic", "Subscribe to this topic in the ntfy app, and use the same text for the worker's NTFY_TOPIC variable. Anyone who knows it can read your pushes, so keep it long and random.", "pushTopic", 22, "obsidian-");
+    textWithGenerate("Push key", "Use the same text for the worker's TOKEN secret, so only your vault can change your reminders.", "pushKey", 32, "");
+    new obsidian.Setting(containerEl).setName("Worker URL").setDesc("Your worker's address, e.g. https://obsidian-reminders.yourname.workers.dev")
+      .addText((t) => { t.setPlaceholder("https://…workers.dev").setValue(st.pushUrl || "").onChange((v) => { st.pushUrl = v.trim(); save(); }); t.inputEl.style.width = "260px"; });
+    new obsidian.Setting(containerEl).setName("Show note titles in pushes")
+      .setDesc("Off: pushes just say “Reminder”, so nothing about your notes passes through Cloudflare or ntfy.")
+      .addToggle((t) => t.setValue(st.pushTitles !== false).onChange((v) => { st.pushTitles = v; save(); }));
+    const status = new obsidian.Setting(containerEl).setName("Check the connection").setDesc(push.lastResult || (push.enabled() ? "Not sent yet." : "Fill in the push key and worker URL first."));
+    status.addButton((b) => b.setButtonText("Send test push").onClick(async () => {
+      try { await push.test(); new obsidian.Notice("Test sent. It should show up on your phone in a few seconds."); status.setDesc("Test push sent."); }
+      catch (e) { new obsidian.Notice("Test failed: " + e.message); status.setDesc("Test failed: " + e.message); }
+    }));
+    status.addButton((b) => b.setButtonText("Send reminders now").setCta().onClick(async () => {
+      try { const r = await push.sync(true); status.setDesc(push.lastResult); new obsidian.Notice(`Worker has ${r ? r.upcoming : 0} upcoming reminders.`); }
+      catch (e) { status.setDesc(push.lastResult); new obsidian.Notice(push.lastResult); }
+    }));
   }
 }
 
@@ -6068,6 +6207,9 @@ class NotionStyleKanbanPlugin extends obsidian.Plugin {
     this.reminders = new ReminderCenter(this);
     this.reminders.load();
     this.register(() => this.reminders.unload());
+    this.push = new ReminderPush(this);
+    this.push.load();
+    this.register(() => this.push.unload());
     // the run id on notes made by repeating templates is bookkeeping: hide it like Notion would
     if (!this.settings.propertyVisibility) this.settings.propertyVisibility = {};
     if (!this.settings.propertyVisibility[RUN_KEY]) this.settings.propertyVisibility[RUN_KEY] = "hide";
