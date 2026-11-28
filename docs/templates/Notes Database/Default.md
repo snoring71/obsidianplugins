@@ -4,6 +4,7 @@ Task Board Item: []
 Related: []
 Topic: Other
 icon: "icons/document_lightgray"
+Date: "{{now:YYYY-MM-DDTHH:mm}}"
 Created: "{{now}}"
 title: ""
 template-default: true

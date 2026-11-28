@@ -4,6 +4,7 @@ Task Board Item: []
 Related: []
 Topic: RM Grooming
 icon: "icons/document_yellow"
+Date: "{{now:YYYY-MM-DDTHH:mm}}"
 Created: "{{now}}"
 title: "RM Grooming"
 ---

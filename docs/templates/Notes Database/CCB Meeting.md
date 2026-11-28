@@ -4,6 +4,7 @@ Task Board Item: []
 Related: []
 Topic: CCB
 icon: "icons/lock_red"
+Date: "{{now:YYYY-MM-DDTHH:mm}}"
 Created: "{{now}}"
 title: "CCB Meeting"
 ---

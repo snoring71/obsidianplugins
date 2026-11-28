@@ -4,6 +4,7 @@ Task Board Item: []
 Related: []
 Topic: RM Review (Monthly)
 icon: "icons/document_red"
+Date: "{{now:YYYY-MM-DDTHH:mm}}"
 Created: "{{now}}"
 title: "RM Review (Monthly)"
 ---
