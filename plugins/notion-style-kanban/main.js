@@ -374,6 +374,7 @@ class NotionKanbanView extends obsidian.BasesView {
     const scrollTop = this.rootEl.scrollTop;
     const s = this.settings();
     this.s = s;
+    this.scope = this.plugin.schemas.scopeOf(this.boardBaseFile()); // the database, for its own option lists
     if (this.collapsedLanes === null) this.collapsedLanes = new Set(asList(this.cfg("collapsedLanes", [])).map(String));
     const { columns, lanes, buckets } = this.collect(s);
     this.childPaths = new Set();
@@ -387,7 +388,7 @@ class NotionKanbanView extends obsidian.BasesView {
     // column headers
     const header = board.createDiv({ cls: "nk-row nk-header-row" });
     columns.forEach((col, ci) => {
-      const rgb = rgbFor(this.plugin.schemas.colorOf(s.columnKey, col) || s.columnColors.get(col.toLowerCase()) || "gray");
+      const rgb = rgbFor(this.plugin.schemas.colorOf(s.columnKey, col, this.scope) || s.columnColors.get(col.toLowerCase()) || "gray");
       const h = header.createDiv({ cls: "nk-col-header" });
       h.style.setProperty("--nk-rgb", rgb);
       const pill = h.createSpan({ cls: "nk-status-pill" });
@@ -408,7 +409,7 @@ class NotionKanbanView extends obsidian.BasesView {
         const caret = lh.createSpan({ cls: "nk-caret" });
         setIconSafe(caret, ["chevron-down"]);
         const lanePill = lh.createSpan({ cls: "nk-lane-pill", text: lane });
-        lanePill.style.setProperty("--nk-rgb", rgbFor((s.laneKey && this.plugin.schemas.colorOf(s.laneKey, lane)) || s.laneColors.get(lane.toLowerCase()) || s.tagColors.get(lane.toLowerCase()) || "blue"));
+        lanePill.style.setProperty("--nk-rgb", rgbFor((s.laneKey && this.plugin.schemas.colorOf(s.laneKey, lane, this.scope)) || s.laneColors.get(lane.toLowerCase()) || s.tagColors.get(lane.toLowerCase()) || "blue"));
         let n = 0;
         columns.forEach((_, ci) => (n += (buckets.get(`${lane}\u0000${ci}`) || []).length));
         lh.createSpan({ cls: "nk-count", text: String(n) });
@@ -417,7 +418,7 @@ class NotionKanbanView extends obsidian.BasesView {
       }
       const row = board.createDiv({ cls: "nk-row" });
       columns.forEach((col, ci) => {
-        const rgb = rgbFor(this.plugin.schemas.colorOf(s.columnKey, col) || s.columnColors.get(col.toLowerCase()) || "gray");
+        const rgb = rgbFor(this.plugin.schemas.colorOf(s.columnKey, col, this.scope) || s.columnColors.get(col.toLowerCase()) || "gray");
         const cell = row.createDiv({ cls: "nk-cell" });
         cell.style.setProperty("--nk-rgb", rgb);
         const list = buckets.get(`${lane}\u0000${ci}`) || [];
@@ -464,7 +465,7 @@ class NotionKanbanView extends obsidian.BasesView {
       const tagRow = card.createDiv({ cls: "nk-tags" });
       for (const t of tags) {
         const p = tagRow.createSpan({ cls: "nk-tag", text: t });
-        p.style.setProperty("--nk-rgb", rgbFor(this.plugin.schemas.colorOf(s.tagKey, t) || s.tagColors.get(t.toLowerCase()) || hashColor(t.toLowerCase())));
+        p.style.setProperty("--nk-rgb", rgbFor(this.plugin.schemas.colorOf(s.tagKey, t, c.file) || s.tagColors.get(t.toLowerCase()) || hashColor(t.toLowerCase())));
       }
     }
 
@@ -1274,6 +1275,11 @@ function sameText(a, b) {
 // Option lists, colors and icons for properties, shared by every note and board in the vault.
 // Stored in data.json as settings.properties = { Tag: { type: "multi", options: [{ name, color }] } }
 // and settings.propertyIcons = { Tag: "tag:gray" }.
+// Like Notion, a database can have its own option list for a property (Notes Database's Status
+// is Needs work / Future / Closed, RM Tasks' is Not started / In progress / ...). Those live in
+// settings.databaseProperties = { "Notes Database": { Status: { type, options } } } and win over
+// the shared list for notes in that database. A "scope" is a database name, or a note / .base
+// file to work it out from (the note's base property, or its Templates/<database>/ folder).
 class PropertySchemas {
   constructor(plugin) {
     this.plugin = plugin;
@@ -1286,36 +1292,114 @@ class PropertySchemas {
     return s.properties;
   }
 
+  get scoped() {
+    const s = this.plugin.settings;
+    if (!s.databaseProperties || typeof s.databaseProperties !== "object") s.databaseProperties = {};
+    return s.databaseProperties;
+  }
+
   get icons() {
     const s = this.plugin.settings;
     if (!s.propertyIcons || typeof s.propertyIcons !== "object") s.propertyIcons = {};
     return s.propertyIcons;
   }
 
-  keyOf(name) {
-    if (!name) return null;
-    if (this.all[name]) return name;
-    return Object.keys(this.all).find((k) => sameText(k, name)) || null;
+  // database name for a note, a .base file or a name
+  scopeOf(x) {
+    if (!x) return null;
+    if (typeof x === "string") return x;
+    if (!(x instanceof obsidian.TFile)) return null;
+    if (x.extension === "base") return x.basename;
+    const fm = (this.app.metadataCache.getFileCache(x) || {}).frontmatter;
+    const link = fm && fm.base ? parseLink(asString(fm.base)).linkpath : "";
+    if (link) return link.split("/").pop().replace(/\.base$/i, "");
+    const root = obsidian.normalizePath(this.plugin.settings.templatesFolder || TEMPLATES_ROOT);
+    const parts = x.path.split("/");
+    if (parts.length >= 3 && parts.slice(0, -2).join("/") === root) return parts[parts.length - 2];
+    return null;
   }
 
-  find(name) {
-    const k = this.keyOf(name);
-    return k ? this.all[k] : null;
+  ownKey(table, name) {
+    if (!table || !name) return null;
+    if (table[name]) return name;
+    return Object.keys(table).find((k) => sameText(k, name)) || null;
   }
 
-  isManaged(name) {
-    const p = this.find(name);
+  // the database's own option lists, if it has any
+  tableFor(scope) {
+    const db = this.scopeOf(scope);
+    if (!db) return null;
+    const k = this.ownKey(this.scoped, db);
+    return k ? this.scoped[k] : null;
+  }
+
+  // true when this database has its own option list for prop
+  hasOwn(prop, scope) {
+    return !!this.ownKey(this.tableFor(scope), prop);
+  }
+
+  // [table, key] that holds prop's options for this scope (the database's own list, else the shared one)
+  locate(name, scope) {
+    if (!name) return [this.all, null];
+    const t = this.tableFor(scope);
+    const own = this.ownKey(t, name);
+    if (own) return [t, own];
+    return [this.all, this.ownKey(this.all, name)];
+  }
+
+  keyOf(name, scope) {
+    return this.locate(name, scope)[1];
+  }
+
+  find(name, scope) {
+    const [t, k] = this.locate(name, scope);
+    return k ? t[k] : null;
+  }
+
+  isManaged(name, scope) {
+    const p = this.find(name, scope);
     return !!(p && (p.type === "select" || p.type === "multi"));
   }
 
-  option(prop, value) {
-    const p = this.find(prop);
+  option(prop, value, scope) {
+    const p = this.find(prop, scope);
     return p && Array.isArray(p.options) ? p.options.find((o) => sameText(o.name, value)) || null : null;
   }
 
-  colorOf(prop, value) {
-    const o = prop ? this.option(prop, value) : null;
+  colorOf(prop, value, scope) {
+    const o = prop ? this.option(prop, value, scope) : null;
     return o ? o.color || "default" : null;
+  }
+
+  // Give a database its own option list for prop, starting from the shared list (or the values its notes use).
+  async separate(prop, scope) {
+    const db = this.scopeOf(scope);
+    if (!db || this.hasOwn(prop, db)) return;
+    const dbKey = this.ownKey(this.scoped, db) || db;
+    if (!this.scoped[dbKey]) this.scoped[dbKey] = {};
+    const shared = this.find(prop, null);
+    const used = new Set();
+    for (const n of this.notesIn(prop, db)) for (const v of n.values) used.add(v.toLowerCase());
+    let options;
+    if (shared) {
+      options = (shared.options || []).filter((o) => used.has(o.name.toLowerCase())).map((o) => ({ ...o }));
+      for (const v of this.valuesInVault(prop, db)) if (!options.some((o) => sameText(o.name, v))) options.push({ name: v, color: "default" });
+    } else {
+      options = this.valuesInVault(prop, db).map((v, i) => ({ name: v, color: OPTION_COLORS[(i % 9) + 1] }));
+    }
+    this.scoped[dbKey][this.ownKey(this.all, prop) || prop] = { type: shared ? shared.type : "select", options };
+    await this.save();
+  }
+
+  // Go back to the shared option list for prop in this database.
+  async rejoin(prop, scope) {
+    const t = this.tableFor(scope);
+    const k = this.ownKey(t, prop);
+    if (!k) return;
+    delete t[k];
+    const db = this.ownKey(this.scoped, this.scopeOf(scope));
+    if (db && !Object.keys(this.scoped[db]).length) delete this.scoped[db];
+    await this.save();
   }
 
   get visibility() {
@@ -1353,26 +1437,28 @@ class PropertySchemas {
   }
 
   // Turn a property into a select / multi-select, seeding options from values already in the vault.
-  async manage(prop, type) {
-    const k = this.keyOf(prop) || prop;
-    const existing = this.all[k];
+  async manage(prop, type, scope) {
+    const [t, k0] = this.locate(prop, scope);
+    const k = k0 || prop;
+    const existing = t[k];
     if (existing) existing.type = type;
     else {
       const options = [];
       for (const v of this.valuesInVault(prop)) options.push({ name: v, color: OPTION_COLORS[(options.length % 9) + 1] });
-      this.all[k] = { type, options };
+      t[k] = { type, options };
     }
     await this.save();
   }
 
-  async unmanage(prop) {
+  async unmanage(prop, scope) {
+    if (this.hasOwn(prop, scope)) return this.rejoin(prop, scope);
     const k = this.keyOf(prop);
     if (k) delete this.all[k];
     await this.save();
   }
 
-  addOption(prop, name, color) {
-    const p = this.find(prop);
+  addOption(prop, name, color, scope) {
+    const p = this.find(prop, scope);
     if (!p) return null;
     if (!Array.isArray(p.options)) p.options = [];
     let o = p.options.find((x) => sameText(x.name, name));
@@ -1395,29 +1481,44 @@ class PropertySchemas {
     return Object.keys(fm).find((k) => sameText(k, prop)) || null;
   }
 
-  *notesWith(prop) {
+  // Notes that use prop's option list for this scope: the database's own notes when it has its
+  // own list, otherwise every note except those in databases with their own list.
+  *notesWith(prop, scope) {
+    const own = this.hasOwn(prop, scope) ? this.scopeOf(scope) : null;
     for (const file of this.app.vault.getMarkdownFiles()) {
+      const fm = (this.app.metadataCache.getFileCache(file) || {}).frontmatter;
+      const k = this.fmKey(fm, prop);
+      if (!k) continue;
+      if (own ? !sameText(this.scopeOf(file) || "", own) : this.hasOwn(prop, file)) continue;
+      yield { file, key: k, values: asList(fm[k]).map(asString).filter(Boolean) };
+    }
+  }
+
+  // notes in one database that have prop
+  *notesIn(prop, db) {
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      if (!sameText(this.scopeOf(file) || "", db)) continue;
       const fm = (this.app.metadataCache.getFileCache(file) || {}).frontmatter;
       const k = this.fmKey(fm, prop);
       if (k) yield { file, key: k, values: asList(fm[k]).map(asString).filter(Boolean) };
     }
   }
 
-  valuesInVault(prop) {
+  valuesInVault(prop, db) {
     const seen = new Map();
-    for (const n of this.notesWith(prop)) for (const v of n.values) if (!seen.has(v.toLowerCase())) seen.set(v.toLowerCase(), v);
+    for (const n of db ? this.notesIn(prop, db) : this.notesWith(prop)) for (const v of n.values) if (!seen.has(v.toLowerCase())) seen.set(v.toLowerCase(), v);
     return [...seen.values()].sort((a, b) => a.localeCompare(b));
   }
 
-  usage(prop, name) {
+  usage(prop, name, scope) {
     let n = 0;
-    for (const x of this.notesWith(prop)) if (x.values.some((v) => sameText(v, name))) n++;
+    for (const x of this.notesWith(prop, scope)) if (x.values.some((v) => sameText(v, name))) n++;
     return n;
   }
 
   // Rename (newName) or remove (newName === null) a value on every note that has it.
-  async rewriteValue(prop, oldName, newName) {
-    const targets = [...this.notesWith(prop)].filter((x) => x.values.some((v) => sameText(v, oldName)));
+  async rewriteValue(prop, oldName, newName, scope) {
+    const targets = [...this.notesWith(prop, scope)].filter((x) => x.values.some((v) => sameText(v, oldName)));
     for (const t of targets) {
       await this.app.fileManager.processFrontMatter(t.file, (fm) => {
         const k = this.fmKey(fm, prop);
@@ -1439,24 +1540,24 @@ class PropertySchemas {
     return targets.length;
   }
 
-  async renameOption(prop, oldName, newName) {
+  async renameOption(prop, oldName, newName, scope) {
     newName = String(newName).trim();
-    const o = this.option(prop, oldName);
+    const o = this.option(prop, oldName, scope);
     if (!o || !newName || newName === o.name) return 0;
-    const dup = this.option(prop, newName);
-    const p = this.find(prop);
+    const dup = this.option(prop, newName, scope);
+    const p = this.find(prop, scope);
     if (dup && dup !== o) p.options = p.options.filter((x) => x !== o); // merging into an existing option
     else o.name = newName;
     await this.save();
-    return this.rewriteValue(prop, oldName, dup && dup !== o ? dup.name : newName);
+    return this.rewriteValue(prop, oldName, dup && dup !== o ? dup.name : newName, scope);
   }
 
-  async deleteOption(prop, name) {
-    const p = this.find(prop);
+  async deleteOption(prop, name, scope) {
+    const p = this.find(prop, scope);
     if (!p) return 0;
     p.options = (p.options || []).filter((o) => !sameText(o.name, name));
     await this.save();
-    return this.rewriteValue(prop, name, null);
+    return this.rewriteValue(prop, name, null, scope);
   }
 }
 
@@ -1500,7 +1601,7 @@ class OptionsPopover {
     this.menu = null;
   }
 
-  get schema() { return this.schemas.find(this.prop) || { type: "multi", options: [] }; }
+  get schema() { return this.schemas.find(this.prop, this.file) || { type: "multi", options: [] }; }
   get multi() { return this.schema.type === "multi"; }
 
   readValues() {
@@ -1576,7 +1677,7 @@ class OptionsPopover {
 
   render() {
     if (!this.el) return;
-    const colorOf = (v) => this.schemas.colorOf(this.prop, v) || "default";
+    const colorOf = (v) => this.schemas.colorOf(this.prop, v, this.file) || "default";
 
     // selected values + search box
     const hadFocus = this.input && document.activeElement === this.input;
@@ -1654,7 +1755,7 @@ class OptionsPopover {
   async choose(row) {
     let name;
     if (row.kind === "create") {
-      const o = this.schemas.addOption(this.prop, row.name.trim());
+      const o = this.schemas.addOption(this.prop, row.name.trim(), undefined, this.file);
       await this.schemas.save();
       name = o.name;
     } else name = row.option.name;
@@ -1696,7 +1797,7 @@ class OptionsPopover {
       const next = input.value.trim();
       if (!next || next === option.name) return;
       const old = option.name;
-      const n = await this.schemas.renameOption(this.prop, old, next);
+      const n = await this.schemas.renameOption(this.prop, old, next, this.file);
       this.values = this.values.map((v) => (sameText(v, old) ? next : v));
       if (n) new obsidian.Notice(`Renamed "${old}" to "${next}" on ${n} note${n === 1 ? "" : "s"}.`);
       this.render();
@@ -1708,10 +1809,10 @@ class OptionsPopover {
     setIconSafe(del.createSpan({ cls: "nk-options-menu-icon" }), ["trash-2", "trash"]);
     del.createSpan({ text: "Delete" });
     del.onclick = () => {
-      const n = this.schemas.usage(this.prop, option.name);
+      const n = this.schemas.usage(this.prop, option.name, this.file);
       this.closeMenu();
       const run = async () => {
-        const changed = await this.schemas.deleteOption(this.prop, option.name);
+        const changed = await this.schemas.deleteOption(this.prop, option.name, this.file);
         this.values = this.values.filter((v) => !sameText(v, option.name));
         if (changed) new obsidian.Notice(`Removed "${option.name}" from ${changed} note${changed === 1 ? "" : "s"}.`);
         this.render();
@@ -1783,7 +1884,7 @@ class PropertyPanel {
       if (!propEl) return;
       ev.preventDefault();
       ev.stopPropagation();
-      this.propertyMenu(propEl.dataset.propertyKey, iconEl, ev);
+      this.propertyMenu(propEl.dataset.propertyKey, iconEl, ev, this.fileOfEl(propEl));
     }, true);
     this.app.workspace.onLayoutReady(() => this.refreshAll());
   }
@@ -1796,7 +1897,16 @@ class PropertyPanel {
     document.querySelectorAll(".nk-managed, .nk-has-icon").forEach((e) => e.removeClass("nk-managed", "nk-has-icon"));
   }
 
-  propertyMenu(prop, iconEl, ev) {
+  // the note whose properties panel holds el
+  fileOfEl(el) {
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const v = leaf.view;
+      if (v && v.file && v.containerEl && v.containerEl.contains(el)) return v.file;
+    }
+    return null;
+  }
+
+  propertyMenu(prop, iconEl, ev, file) {
     const menu = new obsidian.Menu();
     menu.addItem((i) => i.setTitle("Change icon").setIcon("smile-plus").onClick(() => this.pickIcon(prop, iconEl)));
     if (this.schemas.iconOf(prop)) menu.addItem((i) => i.setTitle("Remove icon").setIcon("x").onClick(() => this.schemas.setIcon(prop, null)));
@@ -1806,11 +1916,16 @@ class PropertyPanel {
       menu.addItem((i) => i.setTitle(title).setIcon(icon).setChecked(vis === mode).onClick(() => this.schemas.setVisibility(prop, mode)));
     }
     menu.addSeparator();
-    const cur = this.schemas.find(prop);
+    const cur = this.schemas.find(prop, file);
     const kind = cur ? cur.type : "";
-    menu.addItem((i) => i.setTitle("Notion-style select").setChecked(kind === "select").onClick(() => this.schemas.manage(prop, "select")));
-    menu.addItem((i) => i.setTitle("Notion-style multi-select").setChecked(kind === "multi").onClick(() => this.schemas.manage(prop, "multi")));
-    if (cur) menu.addItem((i) => i.setTitle("Plain Obsidian property").setChecked(false).onClick(() => this.schemas.unmanage(prop)));
+    menu.addItem((i) => i.setTitle("Notion-style select").setChecked(kind === "select").onClick(() => this.schemas.manage(prop, "select", file)));
+    menu.addItem((i) => i.setTitle("Notion-style multi-select").setChecked(kind === "multi").onClick(() => this.schemas.manage(prop, "multi", file)));
+    const db = this.schemas.scopeOf(file);
+    if (cur && db) {
+      const own = this.schemas.hasOwn(prop, db);
+      menu.addItem((i) => i.setTitle(`Separate options for ${db}`).setIcon("split").setChecked(own).onClick(() => (own ? this.schemas.rejoin(prop, db) : this.schemas.separate(prop, db))));
+    }
+    if (cur) menu.addItem((i) => i.setTitle("Plain Obsidian property").setChecked(false).onClick(() => this.schemas.unmanage(prop, file)));
     menu.showAtMouseEvent(ev);
   }
 
@@ -1902,7 +2017,7 @@ class PropertyPanel {
     const valueEl = propEl.querySelector(".metadata-property-value");
     if (!valueEl) return;
     let box = valueEl.querySelector(":scope > .nk-select-value");
-    if (!this.schemas.isManaged(prop)) {
+    if (!this.schemas.isManaged(prop, file)) {
       if (box) box.remove();
       if (propEl.hasClass("nk-managed")) propEl.removeClass("nk-managed");
       return;
@@ -1910,7 +2025,7 @@ class PropertyPanel {
     const fm = (this.app.metadataCache.getFileCache(file) || {}).frontmatter || {};
     const k = this.schemas.fmKey(fm, prop);
     const values = k ? asList(fm[k]).map(asString).filter(Boolean) : [];
-    const sig = JSON.stringify([file.path, values, values.map((v) => this.schemas.colorOf(prop, v))]);
+    const sig = JSON.stringify([file.path, values, values.map((v) => this.schemas.colorOf(prop, v, file))]);
     if (!propEl.hasClass("nk-managed")) propEl.addClass("nk-managed");
     if (box && box.dataset.sig === sig) return;
     if (!box) {
@@ -1926,7 +2041,7 @@ class PropertyPanel {
     box.dataset.path = file.path;
     box.dataset.prop = prop;
     box.empty();
-    for (const v of values) renderOptionPill(box, v, this.schemas.colorOf(prop, v) || "default");
+    for (const v of values) renderOptionPill(box, v, this.schemas.colorOf(prop, v, file) || "default");
     if (!values.length) box.createSpan({ cls: "nk-select-empty", text: "Empty" });
   }
 }
@@ -4244,41 +4359,27 @@ class TextareaLinkSuggest {
     const caret = ta.selectionStart;
     const before = ta.value.slice(0, caret);
     const m = before.match(/\[\[([^\[\]\|#\n]*)$/);
-    if (!m) return this.close();
-    this.start = caret - m[0].length;
-    this.query = m[1];
-    this.items = this.search(m[1]);
+    if (m) {
+      this.mode = "link";
+      this.start = caret - m[0].length;
+      this.query = m[1];
+      this.items = this.search(m[1]);
+    } else {
+      // Notion-style @ menu: dates, reminders and page links
+      const at = before.match(/(?:^|[\s(\[>])@([^@\n{}\[\]]{0,60})$/);
+      if (!at) return this.close();
+      this.mode = "at";
+      this.start = caret - at[1].length - 1;
+      this.query = at[1];
+      this.items = atMenuItems(this.app, at[1], this.sourcePath);
+      if (!this.items.length) return this.close();
+    }
     this.selected = 0;
     this.render();
   }
 
   search(query) {
-    const files = this.app.vault.getFiles().filter((f) => f.path !== this.sourcePath);
-    const q = query.trim();
-    const out = [];
-    if (!q) {
-      // Like Obsidian: most recently opened first, then most recently edited.
-      const recent = (this.app.workspace.getLastOpenFiles ? this.app.workspace.getLastOpenFiles() : []);
-      const byPath = new Map(files.map((f) => [f.path, f]));
-      const seen = new Set();
-      for (const p of recent) { const f = byPath.get(p); if (f && !seen.has(p)) { seen.add(p); out.push(f); } }
-      const rest = files.filter((f) => !seen.has(f.path)).sort((a, b) => b.stat.mtime - a.stat.mtime);
-      return out.concat(rest).slice(0, 20).map((f) => ({ file: f }));
-    }
-    const fuzzy = obsidian.prepareFuzzySearch(q);
-    const scored = [];
-    for (const f of files) {
-      const title = f.extension === "md" ? displayTitle(f, this.app) : f.name;
-      const name = f.extension === "md" ? f.basename : f.name;
-      let best = null;
-      for (const s of [title, name, f.path]) {
-        const r = fuzzy(s);
-        if (r && (!best || r.score > best.score)) best = r;
-      }
-      if (best) scored.push({ file: f, score: best.score + (f.extension === "md" ? 0 : -1) });
-    }
-    scored.sort((a, b) => b.score - a.score || a.file.path.length - b.file.path.length);
-    return scored.slice(0, 30);
+    return searchNotes(this.app, query, this.sourcePath, { limit: 30, all: true }).map((r) => ({ kind: "file", file: r.file }));
   }
 
   render() {
@@ -4294,14 +4395,8 @@ class TextareaLinkSuggest {
       this.listEl.createDiv({ cls: "suggestion-empty", text: "No match found" });
     }
     this.items.forEach((it, i) => {
-      const f = it.file;
       const row = this.listEl.createDiv({ cls: "suggestion-item mod-complex" + (i === this.selected ? " is-selected" : "") });
-      const content = row.createDiv({ cls: "suggestion-content" });
-      const title = f.extension === "md" ? displayTitle(f, this.app) : f.name;
-      content.createDiv({ cls: "suggestion-title", text: title });
-      const folder = f.parent && f.parent.path !== "/" ? f.parent.path : "";
-      const note = title !== f.basename && f.extension === "md" ? (folder ? folder + "/" : "") + f.basename : folder;
-      if (note) content.createDiv({ cls: "suggestion-note", text: note });
+      renderAtItem(this.app, it, row);
       row.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); this.choose(it); });
       row.addEventListener("mousemove", () => { if (this.selected !== i) { this.selected = i; this.highlight(); } });
     });
@@ -4339,12 +4434,10 @@ class TextareaLinkSuggest {
 
   choose(it) {
     const ta = this.el;
-    const f = it.file;
-    const link = this.app.metadataCache.fileToLinktext(f, this.sourcePath, f.extension === "md");
     const caret = ta.selectionStart;
     let end = caret;
-    if (ta.value.slice(caret, caret + 2) === "]]") end += 2;
-    const text = "[[" + link + "]]";
+    if (this.mode !== "at" && ta.value.slice(caret, caret + 2) === "]]") end += 2;
+    const text = this.mode === "at" ? atItemText(this.app, it, this.sourcePath) + " " : linkTextFor(this.app, it.file, this.sourcePath);
     ta.value = ta.value.slice(0, this.start) + text + ta.value.slice(end);
     const pos = this.start + text.length;
     ta.setSelectionRange(pos, pos);
@@ -4710,6 +4803,1249 @@ function commentHiderExtension() {
   return [field];
 }
 
+// ===================== Dates, reminders, the @ menu and smarter link search =====================
+//
+// Date mentions are stored in the note as plain text so they read fine anywhere:
+//   @{2026-12-03}              a date
+//   @{2026-12-03 09:00}        a date and time
+//   @{2026-12-03 09:00 ⏰}      ...with a reminder at that time (date only: 9:00 AM that day)
+//   @{2026-12-03 09:00 ⏰ 1h}   ...with a reminder 1 hour before (m, h, d, w)
+// The plugin shows them as Notion-style chips and fires the reminders.
+
+const DATE_MENTION_SRC = "@\\{(\\d{4}-\\d{2}-\\d{2})(?:[ T](\\d{1,2}:\\d{2}))?(?:\\s*(⏰)\\s*(\\d+[mhdw])?)?\\}";
+const dateMentionRe = () => new RegExp(DATE_MENTION_SRC, "g");
+const DAY_REMINDER_TIME = "09:00";
+const REMIND_TIME_OPTIONS = [
+  ["", "At time of event"], ["5m", "5 minutes before"], ["10m", "10 minutes before"], ["15m", "15 minutes before"],
+  ["30m", "30 minutes before"], ["1h", "1 hour before"], ["2h", "2 hours before"], ["1d", "1 day before"], ["2d", "2 days before"],
+];
+const REMIND_DAY_OPTIONS = [
+  ["", "On day of event (9:00 AM)"], ["1d", "1 day before (9:00 AM)"], ["2d", "2 days before (9:00 AM)"], ["1w", "1 week before (9:00 AM)"],
+];
+const INBOX_VIEW = "nk-inbox";
+const INBOX_LIMIT = 500;
+const DEFAULT_REMINDER_PROPERTIES = ["Reminder Date"];
+const NOTE_DATE_KEYS = ["Date", "Created", "Created time", "Created Date", "Due date", "Due Date", "Last edited time"];
+
+const pad2 = (n) => String(n).padStart(2, "0");
+const normTime = (t) => { if (!t) return null; const [h, m] = t.split(":"); return pad2(Number(h)) + ":" + pad2(Number(m)); };
+
+function mentionFromMatch(m) {
+  return { date: m[1], time: normTime(m[2]), remind: m[3] ? (m[4] || "") : null };
+}
+
+function parseMentionText(raw) {
+  const m = new RegExp("^" + DATE_MENTION_SRC + "$").exec(String(raw || "").trim());
+  return m ? mentionFromMatch(m) : null;
+}
+
+function formatMention(m) {
+  let s = "@{" + m.date;
+  if (m.time) s += " " + m.time;
+  if (m.remind !== null && m.remind !== undefined) s += " ⏰" + (m.remind ? " " + m.remind : "");
+  return s + "}";
+}
+
+function mentionMoment(m) {
+  return obsidian.moment(m.date + " " + (m.time || "00:00"), "YYYY-MM-DD HH:mm");
+}
+
+// When the reminder fires (ms), or null when there is no reminder.
+function reminderTime(m) {
+  if (m.remind === null || m.remind === undefined) return null;
+  const base = obsidian.moment(m.date + " " + (m.time || DAY_REMINDER_TIME), "YYYY-MM-DD HH:mm");
+  if (!base.isValid()) return null;
+  const off = /^(\d+)([mhdw])$/.exec(m.remind || "");
+  if (off) base.subtract(Number(off[1]), { m: "minutes", h: "hours", d: "days", w: "weeks" }[off[2]]);
+  return base.valueOf();
+}
+
+function remindLabel(m) {
+  const opts = m.time ? REMIND_TIME_OPTIONS : REMIND_DAY_OPTIONS;
+  const o = opts.find((x) => x[0] === (m.remind || ""));
+  return o ? o[1] : (m.remind ? m.remind + " before" : "At time of event");
+}
+
+function dayWord(d, now) {
+  const diff = d.clone().startOf("day").diff(obsidian.moment(now).startOf("day"), "days");
+  if (diff === 0) return "Today";
+  if (diff === 1) return "Tomorrow";
+  if (diff === -1) return "Yesterday";
+  return d.format("MMMM D, YYYY");
+}
+
+// "Today 9:00 AM", "December 3, 2026"
+function mentionLabel(m, now) {
+  const d = mentionMoment(m);
+  if (!d.isValid()) return m.date;
+  let s = dayWord(d, now || Date.now());
+  if (m.time) s += " " + d.format("h:mm A");
+  return s;
+}
+
+// ---------- natural-language dates: "tomorrow 9am", "next wednesday", "4 weeks", "11/12/2027" ----------
+
+const WEEKDAY_FULL = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+const MONTH_FULL = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
+const NUM_WORDS = { a: 1, an: 1, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12 };
+
+function weekdayIndex(w) {
+  if (!w || w.length < 2) return -1;
+  return WEEKDAY_FULL.findIndex((d) => d.startsWith(w));
+}
+
+function monthIndex(w) {
+  if (!w || w.length < 3) return -1;
+  return MONTH_FULL.findIndex((m) => m.startsWith(w.replace(/\.$/, "")));
+}
+
+function extractTime(s) {
+  let m = s.match(/(?:^|\s)(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm|a|p)(?=\s|$)/);
+  if (m) {
+    let h = Number(m[1]);
+    const min = Number(m[2] || 0);
+    if (h < 1 || h > 12 || min > 59) return null;
+    if (m[3][0] === "p" && h !== 12) h += 12;
+    if (m[3][0] === "a" && h === 12) h = 0;
+    return { time: pad2(h) + ":" + pad2(min), rest: (s.slice(0, m.index) + " " + s.slice(m.index + m[0].length)).trim() };
+  }
+  m = s.match(/(?:^|\s)(?:at\s+)?(\d{1,2}):(\d{2})(?=\s|$)/);
+  if (m) {
+    const h = Number(m[1]), min = Number(m[2]);
+    if (h > 23 || min > 59) return null;
+    return { time: pad2(h) + ":" + pad2(min), rest: (s.slice(0, m.index) + " " + s.slice(m.index + m[0].length)).trim() };
+  }
+  m = s.match(/(?:^|\s)(?:at\s+)?(noon|midnight)(?=\s|$)/);
+  if (m) return { time: m[1] === "noon" ? "12:00" : "00:00", rest: (s.slice(0, m.index) + " " + s.slice(m.index + m[0].length)).trim() };
+  m = s.match(/(?:^|\s)at\s+(\d{1,2})(?=\s|$)/);
+  if (m) {
+    const h = Number(m[1]);
+    if (h > 23) return null;
+    return { time: pad2(h) + ":00", rest: (s.slice(0, m.index) + " " + s.slice(m.index + m[0].length)).trim() };
+  }
+  return { time: null, rest: s };
+}
+
+// Returns { d: moment (day), time: "HH:mm" | null } or null.
+function parseNaturalDate(input, now) {
+  const moment = obsidian.moment;
+  let s = String(input || "").toLowerCase().replace(/,/g, " ").replace(/\s+/g, " ").trim();
+  if (!s) return null;
+  const n = moment(now || Date.now());
+  if (s === "now" || s === "right now") return { d: n.clone(), time: n.format("HH:mm") };
+  const t = extractTime(s);
+  if (!t) return null;
+  let time = t.time;
+  s = t.rest.replace(/^on\s+/, "").trim();
+  const today = n.clone().startOf("day");
+  let d = null;
+  let m;
+  let yearless = false;
+  if (!s) d = time ? today.clone() : null;
+  else if (/^(today|tod|tdy|tonight)$/.test(s)) { d = today.clone(); if (s === "tonight" && !time) time = "18:00"; }
+  else if (/^(tomorrow|tmr|tmrw|tom|tomorow|tommorow)$/.test(s)) d = today.clone().add(1, "day");
+  else if (/^(yesterday|yday)$/.test(s)) d = today.clone().subtract(1, "day");
+  else if ((m = s.match(/^(?:in\s+)?(\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s*(minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|wks?|w|months?|mos?|years?|yrs?|y)(\s+from now|\s+later)?$/))
+    || (m = s.match(/^(\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s*(minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|wks?|w|months?|mos?|years?|yrs?|y)\s+(ago)$/))) {
+    const qty = NUM_WORDS[m[1]] || Number(m[1]);
+    const u = m[2][0] === "m" && !/^mo/.test(m[2]) ? "minutes" : m[2][0] === "h" ? "hours" : m[2][0] === "d" ? "days" : m[2][0] === "w" ? "weeks" : /^mo/.test(m[2]) ? "months" : "years";
+    const sign = m[3] && m[3].trim() === "ago" ? -1 : 1;
+    if (u === "minutes" || u === "hours") {
+      const at = n.clone().add(sign * qty, u);
+      return { d: at.clone().startOf("day"), time: at.format("HH:mm") };
+    }
+    d = today.clone().add(sign * qty, u);
+  } else if ((m = s.match(/^(next|this|last|coming)?\s*([a-z]+)$/)) && weekdayIndex(m[2]) >= 0 && (m[2].length >= 3 || m[1])) {
+    const wd = weekdayIndex(m[2]);
+    const cur = today.day();
+    if (m[1] === "last") {
+      let back = (cur - wd + 7) % 7 || 7;
+      d = today.clone().subtract(back, "days");
+    } else {
+      let ahead = (wd - cur + 7) % 7;
+      if (m[1] === "next") {
+        // "next wednesday": the Wednesday of next week (weeks start on Sunday)
+        const startNext = today.clone().add(7 - cur, "days");
+        d = startNext.clone().add(wd, "days");
+      } else d = today.clone().add(ahead, "days");
+    }
+  } else if ((m = s.match(/^(next|last|this)\s+(week|month|year)$/))) {
+    const sign = m[1] === "last" ? -1 : m[1] === "this" ? 0 : 1;
+    d = today.clone().add(sign, m[2] + "s");
+  } else if ((m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/))) {
+    d = moment({ year: +m[1], month: +m[2] - 1, day: +m[3] });
+  } else if ((m = s.match(/^(\d{1,2})[\/.-](\d{1,2})(?:[\/.-](\d{2,4}))?$/))) {
+    let y = m[3] ? Number(m[3]) : today.year();
+    if (m[3] && m[3].length === 2) y += 2000;
+    yearless = !m[3];
+    d = moment({ year: y, month: +m[1] - 1, day: +m[2] });
+  } else if ((m = s.match(/^([a-z]+\.?)\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s+(\d{4}))?$/)) && monthIndex(m[1]) >= 0) {
+    yearless = !m[3];
+    d = moment({ year: m[3] ? +m[3] : today.year(), month: monthIndex(m[1]), day: +m[2] });
+  } else if ((m = s.match(/^(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?([a-z]+\.?)(?:\s+(\d{4}))?$/)) && monthIndex(m[2]) >= 0) {
+    yearless = !m[3];
+    d = moment({ year: m[3] ? +m[3] : today.year(), month: monthIndex(m[2]), day: +m[1] });
+  } else if ((m = s.match(/^([a-z]+\.?)(?:\s+(\d{4}))?$/)) && monthIndex(m[1]) >= 0 && m[1].length >= 3) {
+    d = moment({ year: m[2] ? +m[2] : today.year(), month: monthIndex(m[1]), day: 1 });
+  }
+  if (!d || !d.isValid()) return null;
+  // "1/5" or "Jan 5" with no year: the next one, if this year's is well past
+  if (yearless && d.isBefore(today.clone().subtract(30, "days"))) d.add(1, "year");
+  return { d, time };
+}
+
+const DATE_KEYWORDS = ["today", "tomorrow", "yesterday", "now", "next week", "next month",
+  ...WEEKDAY_FULL, ...WEEKDAY_FULL.map((w) => "next " + w), "in 1 week", "in 2 weeks", "in 4 weeks"];
+
+// Date / reminder rows for the @ menu.
+function dateSuggestions(query, now) {
+  let q = String(query || "").toLowerCase().replace(/\s+/g, " ").trimStart();
+  let remindMode = false;
+  const r = q.match(/^rem(?:i(?:n(?:d)?)?)?(?:\s+me)?(?:\s+(?:on|at|in))?(?:\s+|$)/);
+  if (r && (r[0].trim().length >= 3)) { remindMode = true; q = q.slice(r[0].length); }
+  q = q.trim();
+  const out = [];
+  const seen = new Set();
+  const push = (p, remind) => {
+    const m = { date: p.d.format("YYYY-MM-DD"), time: p.time, remind: remind ? "" : null };
+    const key = formatMention(m);
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ kind: "date", m });
+  };
+  const exact = q ? parseNaturalDate(q, now) : null;
+  if (exact) {
+    push(exact, remindMode);
+    if (!remindMode) push(exact.time ? exact : { d: exact.d, time: DAY_REMINDER_TIME }, true);
+  } else if (!q) {
+    const n = obsidian.moment(now || Date.now());
+    if (remindMode) push({ d: n.clone().add(1, "day").startOf("day"), time: DAY_REMINDER_TIME }, true);
+    else {
+      push({ d: n.clone().startOf("day"), time: null }, false);
+      push({ d: n.clone().add(1, "day").startOf("day"), time: null }, false);
+      push({ d: n.clone().add(1, "day").startOf("day"), time: DAY_REMINDER_TIME }, true);
+    }
+  } else {
+    // partly typed: "tom", "next we"
+    for (const k of DATE_KEYWORDS) {
+      if (out.length >= 3) break;
+      if (k.startsWith(q) && k !== q) {
+        const p = parseNaturalDate(k, now);
+        if (p) push(p, remindMode);
+      }
+    }
+  }
+  return { items: out, exact: !!exact || (remindMode && !q) };
+}
+
+// ---------- smarter note search: any word order, relevance then newest first ----------
+
+function normText(s) {
+  return String(s || "").toLowerCase().normalize("NFKD").replace(/[̀-ͯ]/g, "").replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+}
+
+function noteDate(app, f) {
+  const fm = ((app.metadataCache.getFileCache(f) || {}).frontmatter) || {};
+  for (const k of NOTE_DATE_KEYS) {
+    const v = fm[k];
+    if (!v) continue;
+    const t = Date.parse(String(Array.isArray(v) ? v[0] : v));
+    if (!isNaN(t)) return t;
+  }
+  return (f.stat && (f.stat.ctime || f.stat.mtime)) || 0;
+}
+
+function relevance(title, name, qn, words) {
+  let best = -1;
+  for (const s of [title, name]) {
+    if (!s) continue;
+    let tier = -1;
+    if (s === qn) tier = 6;
+    else if (s.startsWith(qn)) tier = 5;
+    else if ((" " + s).includes(" " + qn)) tier = 4;
+    else {
+      const sw = s.split(" ");
+      if (words.every((w) => sw.some((x) => x.startsWith(w)))) tier = 3;
+      else if (words.every((w) => s.includes(w))) tier = 2;
+    }
+    if (tier > best) best = tier;
+  }
+  return best;
+}
+
+// Returns [{ file, tier }], best first. opts: { limit, all (include attachments) }
+function searchNotes(app, query, sourcePath, opts) {
+  const o = Object.assign({ limit: 30, all: false }, opts || {});
+  const files = app.vault.getFiles().filter((f) => f.path !== sourcePath && (o.all || f.extension === "md" || f.extension === "base" || f.extension === "canvas"));
+  const qn = normText(query);
+  const inTemplates = (f) => f.path.startsWith(TEMPLATES_ROOT + "/");
+  if (!qn) {
+    const recent = app.workspace.getLastOpenFiles ? app.workspace.getLastOpenFiles() : [];
+    const byPath = new Map(files.map((f) => [f.path, f]));
+    const out = [];
+    const seen = new Set();
+    for (const p of recent) { const f = byPath.get(p); if (f && !seen.has(p)) { seen.add(p); out.push(f); } }
+    const rest = files.filter((f) => !seen.has(f.path) && !inTemplates(f)).sort((a, b) => b.stat.mtime - a.stat.mtime);
+    return out.concat(rest).slice(0, o.limit).map((file) => ({ file, tier: 0 }));
+  }
+  const words = qn.split(" ").filter(Boolean);
+  const scored = [];
+  for (const f of files) {
+    const isNote = f.extension === "md";
+    const title = normText(isNote ? displayTitle(f, app) : f.name);
+    const name = normText(isNote ? f.basename : f.name);
+    let tier = relevance(title, name, qn, words);
+    if (tier < 0) {
+      // folder words count too ("rm tasks defender"), at the lowest tier
+      const path = normText(f.path);
+      if (words.every((w) => path.includes(w))) tier = 1;
+    }
+    if (tier < 0) continue;
+    if (!isNote) tier -= 0.5;
+    if (inTemplates(f)) tier -= 0.25;
+    scored.push({ file: f, tier, date: noteDate(app, f) });
+  }
+  if (!scored.length) {
+    // nothing matched word for word: fall back to fuzzy (typos)
+    const fuzzy = obsidian.prepareFuzzySearch(query.trim());
+    for (const f of files) {
+      const r = fuzzy(f.extension === "md" ? displayTitle(f, app) : f.name) || fuzzy(f.path);
+      if (r) scored.push({ file: f, tier: r.score / 100, date: noteDate(app, f), fuzzy: r.score });
+    }
+    scored.sort((a, b) => b.fuzzy - a.fuzzy || b.date - a.date);
+    return scored.slice(0, o.limit);
+  }
+  scored.sort((a, b) => b.tier - a.tier || b.date - a.date || a.file.path.length - b.file.path.length);
+  return scored.slice(0, o.limit);
+}
+
+// Items for the @ menu: dates first when the query reads as a date, pages first otherwise.
+function atMenuItems(app, query, sourcePath) {
+  const q = String(query || "");
+  if (/^\s/.test(q) || /\s\s$/.test(q)) return [];
+  const dates = dateSuggestions(q, Date.now());
+  const pages = searchNotes(app, q, sourcePath, { limit: q.trim() ? 12 : 6 }).map((r) => ({ kind: "file", file: r.file }));
+  if (dates.items.length) dates.items[0].header = "Date";
+  if (pages.length) pages[0].header = q.trim() ? "Link to page" : "Recent pages";
+  return dates.exact ? dates.items.concat(pages) : pages.concat(dates.items);
+}
+
+function linkTextFor(app, file, sourcePath) {
+  const link = app.metadataCache.fileToLinktext(file, sourcePath || "", file.extension === "md");
+  const title = file.extension === "md" ? displayTitle(file, app) : "";
+  const last = link.split("/").pop();
+  return title && title !== last && title !== file.basename ? `[[${link}|${linkAlias(title)}]]` : `[[${link}]]`;
+}
+
+function atItemText(app, item, sourcePath) {
+  return item.kind === "date" ? formatMention(item.m) : linkTextFor(app, item.file, sourcePath);
+}
+
+function renderAtItem(app, item, el) {
+  el.addClass("mod-complex", "nk-at-item");
+  if (item.header) el.createDiv({ cls: "nk-at-header", text: item.header });
+  const row = el.createDiv({ cls: "nk-at-row" });
+  const icon = row.createSpan({ cls: "nk-at-icon" });
+  const content = row.createDiv({ cls: "suggestion-content" });
+  if (item.kind === "date") {
+    const rem = item.m.remind !== null;
+    setIconSafe(icon, rem ? ["alarm-clock", "bell"] : ["calendar"]);
+    content.createDiv({ cls: "suggestion-title", text: (rem ? "Remind " : "") + mentionLabel(item.m) });
+    if (rem) content.createDiv({ cls: "suggestion-note", text: "Reminder" });
+    return;
+  }
+  const f = item.file;
+  const fm = f.extension === "md" ? ((app.metadataCache.getFileCache(f) || {}).frontmatter || {}) : {};
+  if (!(fm.icon && renderIconValue(icon, fm.icon))) setIconSafe(icon, f.extension === "base" ? ["table", "database"] : ["file-text", "file"]);
+  const title = f.extension === "md" ? displayTitle(f, app) : f.name;
+  content.createDiv({ cls: "suggestion-title", text: title });
+  const folder = f.parent && f.parent.path !== "/" ? f.parent.path : "";
+  if (folder) content.createDiv({ cls: "suggestion-note", text: folder });
+}
+
+// ---------- editor suggesters ----------
+
+class AtMenuSuggest extends obsidian.EditorSuggest {
+  constructor(plugin) {
+    super(plugin.app);
+    this.plugin = plugin;
+    this.limit = 40;
+  }
+
+  onTrigger(cursor, editor, file) {
+    const before = editor.getLine(cursor.line).slice(0, cursor.ch);
+    const m = before.match(/(?:^|[\s(\[>])@([^@\n{}\[\]]{0,60})$/);
+    if (!m) return null;
+    if (/^\s/.test(m[1])) return null;
+    return { start: { line: cursor.line, ch: cursor.ch - m[1].length - 1 }, end: cursor, query: m[1] };
+  }
+
+  getSuggestions(ctx) {
+    return atMenuItems(this.app, ctx.query, ctx.file ? ctx.file.path : "");
+  }
+
+  renderSuggestion(item, el) { renderAtItem(this.app, item, el); }
+
+  selectSuggestion(item) {
+    const ctx = this.context;
+    if (!ctx) return;
+    const text = atItemText(this.app, item, ctx.file ? ctx.file.path : "") + " ";
+    ctx.editor.replaceRange(text, ctx.start, ctx.end);
+    ctx.editor.setCursor({ line: ctx.start.line, ch: ctx.start.ch + text.length });
+    this.close();
+  }
+}
+
+// [[ suggestions with the same matching. Steps aside for headings (#), blocks (^), aliases (|) and embeds.
+class SmartLinkSuggest extends obsidian.EditorSuggest {
+  constructor(plugin) {
+    super(plugin.app);
+    this.plugin = plugin;
+    this.limit = 40;
+  }
+
+  onTrigger(cursor, editor) {
+    if (this.plugin.settings.smartLinks === false) return null;
+    const before = editor.getLine(cursor.line).slice(0, cursor.ch);
+    const m = before.match(/(!?)\[\[([^\[\]\|#\^\n]*)$/);
+    if (!m || m[1]) return null;
+    return { start: { line: cursor.line, ch: cursor.ch - m[2].length - 2 }, end: cursor, query: m[2] };
+  }
+
+  getSuggestions(ctx) {
+    return searchNotes(this.app, ctx.query, ctx.file ? ctx.file.path : "", { limit: 40, all: true }).map((r) => ({ kind: "file", file: r.file }));
+  }
+
+  renderSuggestion(item, el) { renderAtItem(this.app, item, el); }
+
+  selectSuggestion(item) {
+    const ctx = this.context;
+    if (!ctx) return;
+    const ed = ctx.editor;
+    const after = ed.getLine(ctx.end.line).slice(ctx.end.ch);
+    const end = after.startsWith("]]") ? { line: ctx.end.line, ch: ctx.end.ch + 2 } : ctx.end;
+    const text = linkTextFor(this.app, item.file, ctx.file ? ctx.file.path : "");
+    ed.replaceRange(text, ctx.start, end);
+    ed.setCursor({ line: ctx.start.line, ch: ctx.start.ch + text.length });
+    this.close();
+  }
+}
+
+// ---------- date chips ----------
+
+function createDateChip(m) {
+  const chip = createSpan({ cls: "nk-date-chip" });
+  const rem = m.remind !== null && m.remind !== undefined;
+  if (rem) {
+    chip.addClass("has-reminder");
+    const fire = reminderTime(m);
+    if (fire !== null && fire <= Date.now()) chip.addClass("is-past");
+  }
+  chip.createSpan({ cls: "nk-date-at", text: "@" });
+  chip.createSpan({ cls: "nk-date-text", text: mentionLabel(m) });
+  if (rem) {
+    const i = chip.createSpan({ cls: "nk-date-bell" });
+    setIconSafe(i, ["alarm-clock", "bell"]);
+    chip.setAttr("aria-label", "Reminder: " + remindLabel(m));
+  }
+  return chip;
+}
+
+function dateChipExtension(plugin) {
+  let cmView;
+  try { cmView = require("@codemirror/view"); } catch (e) { return []; }
+  const { ViewPlugin, Decoration, WidgetType } = cmView;
+  const isLive = (state) => {
+    try { return obsidian.editorLivePreviewField ? !!state.field(obsidian.editorLivePreviewField, false) : true; } catch (e) { return true; }
+  };
+  class ChipWidget extends WidgetType {
+    constructor(raw, m) { super(); this.raw = raw; this.m = m; }
+    eq(o) { return o.raw === this.raw; }
+    toDOM(view) {
+      const el = createDateChip(this.m);
+      el.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); });
+      el.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        let pos;
+        try { pos = view.posAtDOM(el); } catch (err) { return; }
+        plugin.dates.editInView(view, pos, this.raw, el);
+      });
+      return el;
+    }
+    ignoreEvent() { return true; }
+  }
+  const build = (view) => {
+    if (!isLive(view.state)) return Decoration.none;
+    const sel = view.state.selection.ranges;
+    const decos = [];
+    for (const { from, to } of view.visibleRanges) {
+      const text = view.state.doc.sliceString(from, to);
+      const re = dateMentionRe();
+      let m;
+      while ((m = re.exec(text))) {
+        const a = from + m.index, b = a + m[0].length;
+        if (sel.some((r) => r.from <= b && r.to >= a)) continue;
+        decos.push(Decoration.replace({ widget: new ChipWidget(m[0], mentionFromMatch(m)) }).range(a, b));
+      }
+    }
+    return Decoration.set(decos, true);
+  };
+  return [ViewPlugin.fromClass(class {
+    constructor(view) { this.decorations = build(view); }
+    update(u) {
+      if (u.docChanged || u.viewportChanged || u.selectionSet || isLive(u.startState) !== isLive(u.state)) this.decorations = build(u.view);
+    }
+  }, { decorations: (v) => v.decorations })];
+}
+
+// Notion-style date editor: calendar, time, reminder, remove.
+class DatePopover {
+  constructor(plugin, m, anchor, onChange) {
+    this.plugin = plugin;
+    this.m = Object.assign({}, m);
+    this.anchor = anchor;
+    this.onChange = onChange;
+    this.month = mentionMoment(this.m).startOf("month");
+    if (!this.month.isValid()) this.month = obsidian.moment().startOf("month");
+  }
+
+  open() {
+    this.el = document.body.createDiv({ cls: "nk-date-pop" });
+    this.el.addEventListener("mousedown", (e) => e.stopPropagation());
+    this.render();
+    this.position();
+    this.outside = (e) => { if (!this.el.contains(e.target)) this.close(); };
+    this.keys = (e) => { if (e.key === "Escape") { e.preventDefault(); this.close(); } };
+    window.setTimeout(() => { document.addEventListener("mousedown", this.outside, true); document.addEventListener("keydown", this.keys, true); }, 0);
+  }
+
+  close() {
+    if (!this.el) return;
+    this.el.remove();
+    this.el = null;
+    document.removeEventListener("mousedown", this.outside, true);
+    document.removeEventListener("keydown", this.keys, true);
+  }
+
+  position() {
+    const r = this.anchor && this.anchor.isConnected ? this.anchor.getBoundingClientRect() : { left: window.innerWidth / 2 - 130, bottom: window.innerHeight / 3, top: window.innerHeight / 3 };
+    const w = 260, h = this.el.offsetHeight || 380;
+    this.el.style.left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8)) + "px";
+    const below = window.innerHeight - r.bottom;
+    this.el.style.top = (below < h + 8 && r.top > h + 8 ? r.top - h - 4 : r.bottom + 4) + "px";
+  }
+
+  set(changes) {
+    Object.assign(this.m, changes);
+    if (this.m.remind !== null && this.m.remind !== undefined) {
+      const opts = this.m.time ? REMIND_TIME_OPTIONS : REMIND_DAY_OPTIONS;
+      if (!opts.some((o) => o[0] === this.m.remind)) this.m.remind = "";
+    }
+    this.onChange(Object.assign({}, this.m));
+    this.render();
+  }
+
+  render() {
+    const el = this.el;
+    el.empty();
+    const d = mentionMoment(this.m);
+    const top = el.createDiv({ cls: "nk-date-inputs" });
+    const di = top.createEl("input", { type: "text", cls: "nk-date-input", value: d.format("MMM D, YYYY") });
+    const commitDate = () => {
+      const p = parseNaturalDate(di.value, Date.now());
+      if (p) { this.month = p.d.clone().startOf("month"); this.set({ date: p.d.format("YYYY-MM-DD"), time: p.time || this.m.time }); }
+      else di.value = d.format("MMM D, YYYY");
+    };
+    di.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); commitDate(); } });
+    di.addEventListener("change", commitDate);
+    if (this.m.time) {
+      const ti = top.createEl("input", { type: "text", cls: "nk-time-input", value: d.format("h:mm A") });
+      const commitTime = () => {
+        const t = extractTime(ti.value.toLowerCase().trim()) || {};
+        const raw = ti.value.trim().match(/^(\d{1,2})$/) ? pad2(Number(ti.value.trim())) + ":00" : t.time;
+        if (raw && !(t.rest || "").length) this.set({ time: raw }); else ti.value = d.format("h:mm A");
+      };
+      ti.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); commitTime(); } });
+      ti.addEventListener("change", commitTime);
+    }
+
+    const nav = el.createDiv({ cls: "nk-cal-nav" });
+    nav.createSpan({ cls: "nk-cal-month", text: this.month.format("MMMM YYYY") });
+    const btns = nav.createDiv({ cls: "nk-cal-btns" });
+    const todayBtn = btns.createSpan({ cls: "nk-cal-today", text: "Today" });
+    todayBtn.onclick = () => { this.month = obsidian.moment().startOf("month"); this.set({ date: obsidian.moment().format("YYYY-MM-DD") }); };
+    const prev = btns.createSpan({ cls: "nk-cal-btn" }); setIconSafe(prev, ["chevron-left"]);
+    const next = btns.createSpan({ cls: "nk-cal-btn" }); setIconSafe(next, ["chevron-right"]);
+    prev.onclick = () => { this.month.subtract(1, "month"); this.render(); };
+    next.onclick = () => { this.month.add(1, "month"); this.render(); };
+
+    const grid = el.createDiv({ cls: "nk-cal-grid" });
+    for (const w of ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]) grid.createSpan({ cls: "nk-cal-wd", text: w });
+    const start = this.month.clone().startOf("week");
+    const todayKey = obsidian.moment().format("YYYY-MM-DD");
+    for (let i = 0; i < 42; i++) {
+      const day = start.clone().add(i, "days");
+      const key = day.format("YYYY-MM-DD");
+      const cell = grid.createSpan({ cls: "nk-cal-day", text: String(day.date()) });
+      if (day.month() !== this.month.month()) cell.addClass("is-other");
+      if (key === todayKey) cell.addClass("is-today");
+      if (key === this.m.date) cell.addClass("is-selected");
+      cell.onclick = () => this.set({ date: key });
+    }
+
+    const opts = el.createDiv({ cls: "nk-date-opts" });
+    const timeRow = opts.createDiv({ cls: "nk-date-opt" });
+    timeRow.createSpan({ text: "Include time" });
+    const tog = timeRow.createDiv({ cls: "checkbox-container" + (this.m.time ? " is-enabled" : "") });
+    tog.onclick = () => this.set({ time: this.m.time ? null : (this.m.remind !== null ? DAY_REMINDER_TIME : obsidian.moment().add(1, "hour").startOf("hour").format("HH:mm")) });
+
+    const remRow = opts.createDiv({ cls: "nk-date-opt" });
+    remRow.createSpan({ text: "Remind" });
+    const sel = remRow.createEl("select", { cls: "dropdown" });
+    sel.createEl("option", { value: "none", text: "None" });
+    for (const [v, label] of (this.m.time ? REMIND_TIME_OPTIONS : REMIND_DAY_OPTIONS)) sel.createEl("option", { value: "r:" + v, text: label });
+    sel.value = this.m.remind === null || this.m.remind === undefined ? "none" : "r:" + this.m.remind;
+    sel.onchange = () => this.set({ remind: sel.value === "none" ? null : sel.value.slice(2) });
+
+    const foot = el.createDiv({ cls: "nk-date-foot" });
+    const del = foot.createDiv({ cls: "nk-date-remove" });
+    setIconSafe(del.createSpan(), ["trash-2"]);
+    del.createSpan({ text: "Remove" });
+    del.onclick = () => { this.onChange(null); this.close(); };
+  }
+}
+
+// Editing chips: works on the live editor view or straight on the file (reading view, comments).
+class DateMentions {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.app = plugin.app;
+  }
+
+  load() {
+    const p = this.plugin;
+    p.registerEditorExtension(dateChipExtension(p));
+    p.registerMarkdownPostProcessor((el, ctx) => this.postProcess(el, ctx));
+    this.at = new AtMenuSuggest(p);
+    p.registerEditorSuggest(this.at);
+    this.links = new SmartLinkSuggest(p);
+    p.registerEditorSuggest(this.links);
+    // ours first, so [[ uses the smarter search before Obsidian's own
+    const mgr = this.app.workspace.editorSuggest;
+    if (mgr && Array.isArray(mgr.suggests)) {
+      for (const s of [this.at, this.links]) {
+        const i = mgr.suggests.indexOf(s);
+        if (i > 0) { mgr.suggests.splice(i, 1); mgr.suggests.unshift(s); }
+      }
+    }
+    p.addCommand({ id: "convert-imported-dates", name: "Convert imported Notion dates to @ dates", callback: () => this.convertImported() });
+    p.addCommand({
+      id: "insert-date-mention",
+      name: "Insert date or reminder (@)",
+      editorCallback: (editor) => {
+        const cur = editor.getCursor();
+        const before = editor.getLine(cur.line).slice(0, cur.ch);
+        editor.replaceRange(before && !/\s$/.test(before) ? " @" : "@", cur);
+        editor.setCursor({ line: cur.line, ch: cur.ch + (before && !/\s$/.test(before) ? 2 : 1) });
+        if (this.at.trigger) try { this.at.trigger(editor, this.app.workspace.getActiveFile(), true); } catch (e) { /* types only */ }
+      },
+    });
+  }
+
+  async convertImported() {
+    const plan = [];
+    let total = 0;
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      if (file.path.startsWith(TEMPLATES_ROOT + "/")) continue;
+      const r = convertImportedDates(await this.app.vault.cachedRead(file));
+      if (r.count) { plan.push(file); total += r.count; }
+    }
+    if (!total) return new obsidian.Notice("No imported Notion dates left to convert.");
+    new ConfirmModal(this.app, "Convert imported dates",
+      `Turn ${total} imported Notion dates in ${plan.length} notes into @ dates? They'll show as date chips you can click to change or add a reminder to. Dates in properties are left alone.`,
+      "Convert", async () => {
+        const notice = new obsidian.Notice("Converting dates…", 0);
+        for (const file of plan) await this.app.vault.process(file, (d) => convertImportedDates(d).text);
+        notice.hide();
+        new obsidian.Notice(`Converted ${total} dates in ${plan.length} notes.`);
+      }).open();
+  }
+
+  postProcess(el, ctx) {
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    while (walker.nextNode()) {
+      const n = walker.currentNode;
+      if (n.nodeValue.includes("@{") && !(n.parentElement && n.parentElement.closest("code, pre, .nk-date-chip"))) nodes.push(n);
+    }
+    let local = 0;
+    for (const n of nodes) {
+      const text = n.nodeValue;
+      const re = dateMentionRe();
+      let m, last = 0;
+      const frag = document.createDocumentFragment();
+      let any = false;
+      while ((m = re.exec(text))) {
+        any = true;
+        frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+        const raw = m[0];
+        const chip = createDateChip(mentionFromMatch(m));
+        const idx = local++;
+        chip.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const info = ctx.getSectionInfo ? ctx.getSectionInfo(el) : null;
+          this.editInFile(ctx.sourcePath, raw, info ? info.lineStart : null, idx, chip);
+        });
+        frag.appendChild(chip);
+        last = m.index + raw.length;
+      }
+      if (!any) continue;
+      frag.appendChild(document.createTextNode(text.slice(last)));
+      n.parentNode.replaceChild(frag, n);
+    }
+  }
+
+  editInView(view, pos, raw, anchor) {
+    const doc = view.state.doc;
+    let at = pos;
+    if (doc.sliceString(at, at + raw.length) !== raw) {
+      const line = doc.lineAt(Math.min(pos, doc.length));
+      const i = line.text.indexOf(raw);
+      if (i < 0) return;
+      at = line.from + i;
+    }
+    let cur = raw;
+    const m = parseMentionText(raw);
+    if (!m) return;
+    new DatePopover(this.plugin, m, anchor, (nm) => {
+      const next = nm ? formatMention(nm) : "";
+      if (view.state.doc.sliceString(at, at + cur.length) !== cur) return;
+      let to = at + cur.length;
+      if (!nm && view.state.doc.sliceString(to, to + 1) === " ") to++;
+      view.dispatch({ changes: { from: at, to, insert: next } });
+      cur = next;
+    }).open();
+  }
+
+  async editInFile(path, raw, lineStart, localIdx, anchor) {
+    const file = this.app.vault.getFileByPath(path);
+    if (!file) return;
+    const m = parseMentionText(raw);
+    if (!m) return;
+    const text = await this.app.vault.read(file);
+    // where this chip's text sits in the file
+    let from = 0;
+    if (lineStart !== null && lineStart !== undefined) {
+      const lines = text.split("\n");
+      for (let i = 0; i < lineStart && i < lines.length; i++) from += lines[i].length + 1;
+    }
+    const occ = [];
+    for (let i = text.indexOf(raw); i >= 0; i = text.indexOf(raw, i + 1)) occ.push(i);
+    if (!occ.length) return;
+    let offset = occ.find((i) => i >= from);
+    if (lineStart === null || lineStart === undefined) offset = occ.length === 1 ? occ[0] : occ[Math.min(localIdx, occ.length - 1)];
+    if (offset === undefined) offset = occ[0];
+    let cur = raw;
+    new DatePopover(this.plugin, m, anchor, (nm) => {
+      const next = nm ? formatMention(nm) : "";
+      const prevLen = cur.length;
+      const expect = cur;
+      cur = next;
+      this.app.vault.process(file, (data) => {
+        if (data.slice(offset, offset + prevLen) !== expect) return data;
+        let end = offset + prevLen;
+        if (!nm && data[end] === " ") end++;
+        return data.slice(0, offset) + next + data.slice(end);
+      });
+    }).open();
+  }
+}
+
+
+// The Notion importer wrote date mentions as space-padded ISO text ("approved  2025-11-20T12:00:00.000-06:00  ").
+const IMPORTED_DATE_RE = /(\s) (\d{4}-\d{2}-\d{2})(?:T(\d{2}:\d{2})(?::\d{2}(?:\.\d{1,3})?)?(Z|[+-]\d{2}:\d{2})?)?(?= |$)/gm;
+
+function convertImportedDates(text) {
+  const cut = splitFrontmatter(text);
+  const head = text.slice(0, cut);
+  let n = 0;
+  let inCode = false;
+  const body = text.slice(cut).split("\n").map((line) => {
+    if (/^\s*(```|~~~)/.test(line)) { inCode = !inCode; return line; }
+    if (inCode) return line;
+    return line.replace(IMPORTED_DATE_RE, (all, ws, date, time, zone) => {
+      let m = { date, time: null, remind: null };
+      if (time) {
+        const t = zone ? obsidian.moment(`${date}T${time}:00${zone === "Z" ? "Z" : zone}`) : obsidian.moment(`${date} ${time}`, "YYYY-MM-DD HH:mm");
+        if (!t.isValid()) return all;
+        m = { date: t.format("YYYY-MM-DD"), time: t.format("HH:mm"), remind: null };
+      }
+      n++;
+      return ws + formatMention(m);
+    });
+  }).join("\n");
+  return { text: head + body, count: n };
+}
+
+// ---------- reminders: index, firing, inbox ----------
+
+function plainContext(line, raw) {
+  return String(line || "")
+    .replace(raw, "")
+    .replace(/^\s*>+\s*/, "")
+    .replace(/^\s*(?:[-*+]|\d+\.)\s+(?:\[.\]\s+)?/, "")
+    .replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, "$2")
+    .replace(/\[\[([^\]]+)\]\]/g, (s, a) => a.split("/").pop())
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(dateMentionRe(), (s) => { const m = parseMentionText(s); return m ? "@" + mentionLabel(m) : s; })
+    .replace(/[*_`~]+/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 160);
+}
+
+function propReminderTime(v) {
+  const s = String(Array.isArray(v) ? v[0] : v || "").trim();
+  const m = s.match(/^(\d{4}-\d{2}-\d{2})(?:[T ](\d{1,2}:\d{2}))?/);
+  if (!m) return null;
+  const t = obsidian.moment(m[1] + " " + (normTime(m[2]) || DAY_REMINDER_TIME), "YYYY-MM-DD HH:mm");
+  return t.isValid() ? t.valueOf() : null;
+}
+
+function entryIsRead(e) { return (e.readAt || 0) > (e.unreadAt || 0); }
+
+function mergeInbox(a, b) {
+  const map = new Map();
+  for (const e of [...(a || []), ...(b || [])]) {
+    const old = map.get(e.id);
+    if (!old) { map.set(e.id, Object.assign({}, e)); continue; }
+    old.readAt = Math.max(old.readAt || 0, e.readAt || 0) || undefined;
+    old.unreadAt = Math.max(old.unreadAt || 0, e.unreadAt || 0) || undefined;
+    old.firedAt = Math.min(old.firedAt || Infinity, e.firedAt || Infinity);
+  }
+  return [...map.values()].sort((x, y) => y.fireAt - x.fireAt).slice(0, INBOX_LIMIT);
+}
+
+class ReminderCenter {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.app = plugin.app;
+    this.byFile = new Map(); // path -> [reminder]
+    this.ready = false;
+    this.pending = new Set();
+  }
+
+  get settings() { return this.plugin.settings; }
+
+  load() {
+    const p = this.plugin;
+    if (!Array.isArray(this.settings.inbox)) this.settings.inbox = [];
+    if (!this.settings.remindersSince) {
+      // reminders that were already due before the plugin first ran are not news
+      this.settings.remindersSince = Date.now();
+      p.saveData(p.settings);
+    }
+    p.registerView(INBOX_VIEW, (leaf) => new InboxView(leaf, p));
+    this.ribbon = p.addRibbonIcon("inbox", "Inbox", () => this.openInbox());
+    this.ribbon.addClass("nk-inbox-ribbon");
+    p.addCommand({ id: "open-inbox", name: "Open inbox", callback: () => this.openInbox() });
+    p.addCommand({ id: "mark-inbox-read", name: "Mark all inbox notifications as read", callback: () => this.markAllRead() });
+    p.addCommand({ id: "check-reminders", name: "Check reminders now", callback: async () => { await this.scanAll(); this.ready = true; this.check(true); } });
+
+    const queue = (f) => this.queueScan(f);
+    p.registerEvent(this.app.vault.on("modify", queue));
+    p.registerEvent(this.app.vault.on("create", queue));
+    p.registerEvent(this.app.metadataCache.on("changed", queue));
+    p.registerEvent(this.app.vault.on("delete", (f) => { if (this.byFile.delete(f.path)) this.changed(); }));
+    p.registerEvent(this.app.vault.on("rename", (f, old) => { this.byFile.delete(old); this.queueScan(f); }));
+    p.registerInterval(window.setInterval(() => this.check(), 20000));
+    p.registerDomEvent(document, "visibilitychange", () => { if (document.visibilityState === "visible") window.setTimeout(() => this.check(), 1500); });
+
+    this.app.workspace.onLayoutReady(async () => {
+      await this.scanAll();
+      const v = Number(this.settings.repeatDelaySeconds);
+      const delay = (isNaN(v) ? 15 : Math.max(0, v)) * 1000;
+      this.startTimer = window.setTimeout(() => { this.ready = true; this.check(); if (this.plugin.push) this.plugin.push.soon(); }, delay);
+      this.updateBadge();
+    });
+  }
+
+  unload() {
+    if (this.startTimer) window.clearTimeout(this.startTimer);
+    if (this.scanTimer) window.clearTimeout(this.scanTimer);
+  }
+
+  queueScan(f) {
+    if (!(f instanceof obsidian.TFile) || f.extension !== "md") return;
+    this.pending.add(f.path);
+    if (this.scanTimer) window.clearTimeout(this.scanTimer);
+    this.scanTimer = window.setTimeout(async () => {
+      const paths = [...this.pending];
+      this.pending.clear();
+      for (const path of paths) {
+        const file = this.app.vault.getFileByPath(path);
+        if (file) await this.scanFile(file);
+      }
+      this.changed();
+    }, 800);
+  }
+
+  async scanAll() {
+    const files = this.app.vault.getMarkdownFiles();
+    for (let i = 0; i < files.length; i++) {
+      await this.scanFile(files[i]);
+      if (i % 100 === 99) await new Promise((r) => window.setTimeout(r, 0));
+    }
+    this.changed();
+  }
+
+  async scanFile(file) {
+    const out = [];
+    const cache = this.app.metadataCache.getFileCache(file) || {};
+    const fm = cache.frontmatter || {};
+    let text = null;
+    try { text = await this.app.vault.cachedRead(file); } catch (e) { text = null; }
+    if (text && text.includes("⏰")) {
+      const lines = text.split("\n");
+      lines.forEach((line, i) => {
+        if (!line.includes("⏰")) return;
+        const re = dateMentionRe();
+        let m;
+        while ((m = re.exec(line))) {
+          const mm = mentionFromMatch(m);
+          const fireAt = reminderTime(mm);
+          if (fireAt === null) continue;
+          const context = plainContext(line, m[0]);
+          out.push({ id: `at|${fireAt}|${m[0]}|${context.slice(0, 60)}|${fm["notion-id"] || file.basename}`, kind: "inline", path: file.path, line: i, raw: m[0], m: mm, fireAt, text: context });
+        }
+      });
+    }
+    for (const key of (this.settings.reminderProperties || DEFAULT_REMINDER_PROPERTIES)) {
+      if (!key || fm[key] === undefined || fm[key] === null || fm[key] === "") continue;
+      const fireAt = propReminderTime(fm[key]);
+      if (fireAt === null) continue;
+      out.push({ id: `prop|${key}|${fireAt}|${fm["notion-id"] || file.path}`, kind: "property", path: file.path, line: 0, prop: key, fireAt, text: key });
+    }
+    if (out.length) this.byFile.set(file.path, out); else this.byFile.delete(file.path);
+  }
+
+  all() {
+    const out = [];
+    for (const list of this.byFile.values()) out.push(...list);
+    return out;
+  }
+
+  upcoming() {
+    const now = Date.now();
+    return this.all().filter((r) => r.fireAt > now).sort((a, b) => a.fireAt - b.fireAt);
+  }
+
+  changed() {
+    this.refreshViews();
+    if (this.plugin.push) this.plugin.push.soon();
+  }
+
+  check(manual) {
+    if (!this.ready) return;
+    const now = Date.now();
+    const since = this.settings.remindersSince || now;
+    const inbox = this.settings.inbox || (this.settings.inbox = []);
+    const have = new Set(inbox.map((e) => e.id));
+    const fresh = [];
+    for (const r of this.all()) {
+      if (r.fireAt > now || r.fireAt < since || have.has(r.id)) continue;
+      const file = this.app.vault.getFileByPath(r.path);
+      fresh.push({ id: r.id, path: r.path, line: r.line, title: file ? displayTitle(file, this.app) : r.path, text: r.text, fireAt: r.fireAt, firedAt: now });
+      have.add(r.id);
+    }
+    if (!fresh.length) { if (manual) new obsidian.Notice("No reminders are due."); return; }
+    this.settings.inbox = mergeInbox(inbox, fresh);
+    this.plugin.saveData(this.plugin.settings);
+    const recent = fresh.filter((e) => now - e.fireAt < 10 * 60 * 1000);
+    const missed = fresh.length - recent.length;
+    for (const e of recent.slice(0, 3)) this.notify(e);
+    if (recent.length > 3 || missed) {
+      const n = new obsidian.Notice(`${missed ? missed + " reminder" + (missed === 1 ? "" : "s") + " came due while Obsidian was closed" : fresh.length + " reminders"}. Open the inbox to see them.`, 10000);
+      if (n.noticeEl) n.noticeEl.onclick = () => this.openInbox();
+    }
+    this.refreshViews();
+  }
+
+  notify(e) {
+    const label = e.text && e.text !== e.title ? e.text : "";
+    const n = new obsidian.Notice("", 15000);
+    if (n.noticeEl) {
+      n.noticeEl.empty();
+      n.noticeEl.addClass("nk-reminder-notice");
+      const head = n.noticeEl.createDiv({ cls: "nk-reminder-notice-head" });
+      setIconSafe(head.createSpan(), ["alarm-clock", "bell"]);
+      head.createSpan({ text: "Reminder · " + obsidian.moment(e.fireAt).format("h:mm A") });
+      n.noticeEl.createDiv({ cls: "nk-reminder-notice-title", text: e.title });
+      if (label) n.noticeEl.createDiv({ cls: "nk-reminder-notice-text", text: label });
+      n.noticeEl.onclick = () => this.openEntry(e);
+    }
+    if (this.settings.desktopNotifications !== false && obsidian.Platform.isDesktopApp && typeof Notification !== "undefined") {
+      try {
+        const show = () => {
+          const dn = new Notification(e.title, { body: label || "Reminder", silent: false });
+          dn.onclick = () => { try { window.focus(); } catch (x) { /* ignore */ } this.openEntry(e); };
+        };
+        if (Notification.permission === "granted") show();
+        else if (Notification.permission !== "denied") Notification.requestPermission().then((p) => { if (p === "granted") show(); });
+      } catch (err) { /* notifications unavailable */ }
+    }
+  }
+
+  async openEntry(e, markRead = true) {
+    const file = this.app.vault.getFileByPath(e.path);
+    if (markRead && e.id) this.setRead(e.id, true);
+    if (!file) return new obsidian.Notice("That note no longer exists.");
+    const leaf = this.app.workspace.getLeaf(false);
+    await leaf.openFile(file, { eState: { line: e.line || 0 } });
+  }
+
+  setRead(id, read) {
+    const e = (this.settings.inbox || []).find((x) => x.id === id);
+    if (!e || entryIsRead(e) === read) return;
+    if (read) e.readAt = Date.now(); else e.unreadAt = Date.now();
+    this.plugin.saveData(this.plugin.settings);
+    this.refreshViews();
+  }
+
+  markAllRead() {
+    const now = Date.now();
+    let n = 0;
+    for (const e of this.settings.inbox || []) if (!entryIsRead(e)) { e.readAt = now; n++; }
+    if (n) this.plugin.saveData(this.plugin.settings);
+    this.refreshViews();
+  }
+
+  unreadCount() { return (this.settings.inbox || []).filter((e) => !entryIsRead(e)).length; }
+
+  updateBadge() {
+    if (!this.ribbon) return;
+    const n = this.unreadCount();
+    this.ribbon.setAttr("data-count", n > 99 ? "99+" : String(n));
+    this.ribbon.toggleClass("has-unread", n > 0);
+  }
+
+  refreshViews() {
+    this.updateBadge();
+    for (const leaf of this.app.workspace.getLeavesOfType(INBOX_VIEW)) if (leaf.view && leaf.view.render) leaf.view.render();
+  }
+
+  async openInbox() {
+    let leaf = this.app.workspace.getLeavesOfType(INBOX_VIEW)[0];
+    if (!leaf) {
+      leaf = this.app.workspace.getRightLeaf(false) || this.app.workspace.getLeaf(true);
+      await leaf.setViewState({ type: INBOX_VIEW, active: true });
+    }
+    this.app.workspace.revealLeaf(leaf);
+  }
+}
+
+
+// ---------- phone pushes through a Cloudflare worker + ntfy (cloudflare/reminder-push/worker.js) ----------
+
+function randomToken(n) {
+  const chars = "abcdefghijkmnpqrstuvwxyz23456789";
+  const bytes = new Uint8Array(n);
+  (window.crypto || crypto).getRandomValues(bytes);
+  return Array.from(bytes, (b) => chars[b % chars.length]).join("");
+}
+
+function hashString(str) {
+  // FNV-1a, twice with different seeds -> 16 hex chars; keeps note text out of the ids we send
+  let h1 = 0x811c9dc5, h2 = 0x01000193 ^ 0x5bd1e995;
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ c, 0x01000193 + 2) >>> 0;
+  }
+  return h1.toString(16).padStart(8, "0") + h2.toString(16).padStart(8, "0");
+}
+
+class ReminderPush {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.app = plugin.app;
+    this.lastResult = "";
+  }
+
+  get s() { return this.plugin.settings; }
+  enabled() { return !!(this.s.pushUrl && this.s.pushKey); }
+  base() { return String(this.s.pushUrl || "").trim().replace(/\/+$/, ""); }
+
+  load() {
+    // re-send now and then in case the worker lost its copy
+    this.plugin.registerInterval(window.setInterval(() => this.sync(true), 6 * 60 * 60 * 1000));
+  }
+
+  unload() { if (this.timer) window.clearTimeout(this.timer); }
+
+  soon() {
+    if (!this.enabled() || !this.plugin.reminders || !this.plugin.reminders.ready) return;
+    if (this.timer) window.clearTimeout(this.timer);
+    this.timer = window.setTimeout(() => this.sync(false), 5000);
+  }
+
+  payload() {
+    const now = Date.now();
+    const horizon = now + 400 * 864e5;
+    const vault = encodeURIComponent(this.app.vault.getName());
+    const titles = this.s.pushTitles !== false;
+    return this.plugin.reminders.all()
+      .filter((r) => r.fireAt > now - 5 * 60 * 1000 && r.fireAt < horizon)
+      .sort((a, b) => a.fireAt - b.fireAt)
+      .slice(0, 1000)
+      .map((r) => {
+        const id = hashString(r.id);
+        if (!titles) return { id, fireAt: r.fireAt, title: "Reminder", text: "Open Obsidian to see it.", click: `obsidian://open?vault=${vault}` };
+        const file = this.app.vault.getFileByPath(r.path);
+        return {
+          id,
+          fireAt: r.fireAt,
+          title: file ? displayTitle(file, this.app) : "Reminder",
+          text: r.kind === "property" ? r.prop : (r.text || "Reminder"),
+          click: `obsidian://open?vault=${vault}&file=${encodeURIComponent(r.path)}`,
+        };
+      });
+  }
+
+  async call(path, body) {
+    const res = await obsidian.requestUrl({
+      url: this.base() + path,
+      method: "POST",
+      headers: { Authorization: "Bearer " + String(this.s.pushKey || "").trim(), "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+      throw: false,
+    });
+    let data = {};
+    try { data = res.json || JSON.parse(res.text); } catch (e) { data = { error: res.text }; }
+    if (res.status !== 200 || !data.ok) throw new Error((data && data.error) || "HTTP " + res.status);
+    return data;
+  }
+
+  async sync(force) {
+    if (!this.enabled()) return null;
+    if (!force && !(this.plugin.reminders && this.plugin.reminders.ready)) return null;
+    const reminders = this.payload();
+    const body = JSON.stringify(reminders);
+    const key = "nk-push-hash";
+    const hash = hashString(this.base() + body);
+    let last = null;
+    try { last = window.localStorage.getItem(key); } catch (e) { /* no storage */ }
+    if (!force && last === hash) return null;
+    try {
+      const r = await this.call("/sync", { reminders });
+      try { window.localStorage.setItem(key, hash); } catch (e) { /* no storage */ }
+      this.lastResult = `Sent ${r.upcoming} upcoming reminder${r.upcoming === 1 ? "" : "s"} · ${obsidian.moment().format("h:mm A")}`;
+      return r;
+    } catch (e) {
+      this.lastResult = "Couldn't reach the worker: " + e.message;
+      console.warn("Notion-style Kanban: reminder push sync failed", e);
+      if (force) throw e;
+      return null;
+    }
+  }
+
+  async test() {
+    await this.call("/test", {});
+  }
+}
+
+class InboxView extends obsidian.ItemView {
+  constructor(leaf, plugin) {
+    super(leaf);
+    this.plugin = plugin;
+    this.tab = "inbox";
+    this.filter = plugin.settings.inboxFilter || "all";
+  }
+
+  getViewType() { return INBOX_VIEW; }
+  getDisplayText() { return "Inbox"; }
+  getIcon() { return "inbox"; }
+  async onOpen() { this.render(); this.registerInterval(window.setInterval(() => this.render(), 60000)); }
+
+  render() {
+    const root = this.contentEl;
+    root.empty();
+    root.addClass("nk-inbox");
+    const rc = this.plugin.reminders;
+    const head = root.createDiv({ cls: "nk-inbox-head" });
+    const tabs = head.createDiv({ cls: "nk-inbox-tabs" });
+    const unread = rc.unreadCount();
+    for (const [id, label] of [["inbox", "Inbox" + (unread ? ` (${unread})` : "")], ["upcoming", "Upcoming"]]) {
+      const t = tabs.createSpan({ cls: "nk-inbox-tab" + (this.tab === id ? " is-active" : ""), text: label });
+      t.onclick = () => { this.tab = id; this.render(); };
+    }
+    if (this.tab === "inbox") {
+      const tools = head.createDiv({ cls: "nk-inbox-tools" });
+      const sel = tools.createEl("select", { cls: "dropdown" });
+      for (const [v, l] of [["all", "Unread & read"], ["unread", "Unread"], ["read", "Read"]]) sel.createEl("option", { value: v, text: l });
+      sel.value = this.filter;
+      sel.onchange = () => { this.filter = sel.value; this.plugin.settings.inboxFilter = sel.value; this.plugin.saveData(this.plugin.settings); this.render(); };
+      const all = tools.createSpan({ cls: "nk-inbox-tool", attr: { "aria-label": "Mark all as read" } });
+      setIconSafe(all, ["check-check", "check"]);
+      all.onclick = () => rc.markAllRead();
+      this.renderInbox(root.createDiv({ cls: "nk-inbox-list" }));
+    } else this.renderUpcoming(root.createDiv({ cls: "nk-inbox-list" }));
+  }
+
+  renderInbox(list) {
+    const rc = this.plugin.reminders;
+    let items = (this.plugin.settings.inbox || []).slice().sort((a, b) => b.fireAt - a.fireAt);
+    if (this.filter === "unread") items = items.filter((e) => !entryIsRead(e));
+    if (this.filter === "read") items = items.filter(entryIsRead);
+    if (!items.length) {
+      list.createDiv({ cls: "nk-inbox-empty", text: this.filter === "unread" ? "You're all caught up." : "No notifications yet. Reminders you set with @ show up here when they're due." });
+      return;
+    }
+    for (const e of items) {
+      const read = entryIsRead(e);
+      const row = list.createDiv({ cls: "nk-inbox-item" + (read ? " is-read" : "") });
+      const icon = row.createSpan({ cls: "nk-inbox-icon" });
+      setIconSafe(icon, ["alarm-clock", "bell"]);
+      const main = row.createDiv({ cls: "nk-inbox-main" });
+      const top = main.createDiv({ cls: "nk-inbox-top" });
+      top.createSpan({ cls: "nk-inbox-kind", text: "Reminder" });
+      top.createSpan({ cls: "nk-inbox-time", text: obsidian.moment(e.fireAt).calendar(null, { sameElse: "MMM D, YYYY [at] h:mm A" }) });
+      const file = this.app.vault.getFileByPath(e.path);
+      main.createDiv({ cls: "nk-inbox-title", text: file ? displayTitle(file, this.app) : e.title });
+      if (e.text && e.text !== e.title) main.createDiv({ cls: "nk-inbox-text", text: e.text });
+      const dot = row.createSpan({ cls: "nk-inbox-dot", attr: { "aria-label": read ? "Mark as unread" : "Mark as read" } });
+      dot.onclick = (ev) => { ev.stopPropagation(); rc.setRead(e.id, !read); };
+      row.onclick = () => rc.openEntry(e);
+    }
+  }
+
+  renderUpcoming(list) {
+    const rc = this.plugin.reminders;
+    const items = rc.upcoming();
+    if (!items.length) {
+      list.createDiv({ cls: "nk-inbox-empty", text: "No upcoming reminders. Type @ in a note, then something like “remind tomorrow 9am”." });
+      return;
+    }
+    let lastDay = "";
+    for (const r of items) {
+      const day = dayWord(obsidian.moment(r.fireAt), Date.now());
+      if (day !== lastDay) { list.createDiv({ cls: "nk-inbox-day", text: day }); lastDay = day; }
+      const row = list.createDiv({ cls: "nk-inbox-item is-upcoming" });
+      const icon = row.createSpan({ cls: "nk-inbox-icon" });
+      setIconSafe(icon, ["alarm-clock", "bell"]);
+      const main = row.createDiv({ cls: "nk-inbox-main" });
+      const top = main.createDiv({ cls: "nk-inbox-top" });
+      top.createSpan({ cls: "nk-inbox-time", text: obsidian.moment(r.fireAt).format("h:mm A") });
+      const file = this.app.vault.getFileByPath(r.path);
+      main.createDiv({ cls: "nk-inbox-title", text: file ? displayTitle(file, this.app) : r.path });
+      if (r.text) main.createDiv({ cls: "nk-inbox-text", text: r.kind === "property" ? r.prop : r.text });
+      row.onclick = () => rc.openEntry(r, false);
+    }
+  }
+}
+
 class CommentSettingTab extends obsidian.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
@@ -4755,6 +6091,58 @@ class CommentSettingTab extends obsidian.PluginSettingTab {
     new obsidian.Setting(containerEl)
       .setName("Manage templates")
       .addButton((b) => b.setButtonText("Open").onClick(() => this.plugin.templates.openManager()));
+
+    const st = this.plugin.settings;
+    const save = () => this.plugin.saveData(st);
+    new obsidian.Setting(containerEl).setName("Dates, reminders and links").setHeading();
+    new obsidian.Setting(containerEl)
+      .setName("Smarter [[ link suggestions")
+      .setDesc("Match words in any order, and list the best matches first, newest first among equals. Turn off to use Obsidian's own suggestions.")
+      .addToggle((t) => t.setValue(st.smartLinks !== false).onChange((v) => { st.smartLinks = v; save(); }));
+    new obsidian.Setting(containerEl)
+      .setName("Desktop notifications")
+      .setDesc("Show a system notification when a reminder is due, as well as a notice inside Obsidian.")
+      .addToggle((t) => t.setValue(st.desktopNotifications !== false).onChange((v) => { st.desktopNotifications = v; save(); }));
+    new obsidian.Setting(containerEl)
+      .setName("Reminder properties")
+      .setDesc("Date properties that act as reminders, one per line. A date without a time reminds you at 9:00 AM.")
+      .addTextArea((t) => {
+        t.setValue((st.reminderProperties || DEFAULT_REMINDER_PROPERTIES).join("\n")).onChange((v) => {
+          st.reminderProperties = v.split("\n").map((x) => x.trim()).filter(Boolean);
+          save();
+          this.plugin.reminders.scanAll();
+        });
+        t.inputEl.rows = 3;
+      });
+
+    new obsidian.Setting(containerEl).setName("Phone notifications").setHeading();
+    containerEl.createEl("p", { cls: "setting-item-description", text: "Reminders reach your phone through a small Cloudflare worker and the ntfy app, even when Obsidian is closed. Setup steps: docs/reminder-push-setup.md in the plugin repo." });
+    const push = this.plugin.push;
+    const textWithGenerate = (name, desc, key, len, prefix) => {
+      new obsidian.Setting(containerEl).setName(name).setDesc(desc)
+        .addText((t) => {
+          t.setValue(st[key] || "").onChange((v) => { st[key] = v.trim(); save(); });
+          t.inputEl.style.width = "220px";
+        })
+        .addExtraButton((b) => b.setIcon("copy").setTooltip("Copy").onClick(() => { navigator.clipboard.writeText(st[key] || ""); new obsidian.Notice("Copied."); }))
+        .addExtraButton((b) => b.setIcon("refresh-cw").setTooltip("Make a new one").onClick(async () => { st[key] = prefix + randomToken(len); await save(); this.display(); }));
+    };
+    textWithGenerate("ntfy topic", "Subscribe to this topic in the ntfy app, and use the same text for the worker's NTFY_TOPIC variable. Anyone who knows it can read your pushes, so keep it long and random.", "pushTopic", 22, "obsidian-");
+    textWithGenerate("Push key", "Use the same text for the worker's TOKEN secret, so only your vault can change your reminders.", "pushKey", 32, "");
+    new obsidian.Setting(containerEl).setName("Worker URL").setDesc("Your worker's address, e.g. https://obsidian-reminders.yourname.workers.dev")
+      .addText((t) => { t.setPlaceholder("https://…workers.dev").setValue(st.pushUrl || "").onChange((v) => { st.pushUrl = v.trim(); save(); }); t.inputEl.style.width = "260px"; });
+    new obsidian.Setting(containerEl).setName("Show note titles in pushes")
+      .setDesc("Off: pushes just say “Reminder”, so nothing about your notes passes through Cloudflare or ntfy.")
+      .addToggle((t) => t.setValue(st.pushTitles !== false).onChange((v) => { st.pushTitles = v; save(); }));
+    const status = new obsidian.Setting(containerEl).setName("Check the connection").setDesc(push.lastResult || (push.enabled() ? "Not sent yet." : "Fill in the push key and worker URL first."));
+    status.addButton((b) => b.setButtonText("Send test push").onClick(async () => {
+      try { await push.test(); new obsidian.Notice("Test sent. It should show up on your phone in a few seconds."); status.setDesc("Test push sent."); }
+      catch (e) { new obsidian.Notice("Test failed: " + e.message); status.setDesc("Test failed: " + e.message); }
+    }));
+    status.addButton((b) => b.setButtonText("Send reminders now").setCta().onClick(async () => {
+      try { const r = await push.sync(true); status.setDesc(push.lastResult); new obsidian.Notice(`Worker has ${r ? r.upcoming : 0} upcoming reminders.`); }
+      catch (e) { status.setDesc(push.lastResult); new obsidian.Notice(push.lastResult); }
+    }));
   }
 }
 
@@ -4877,6 +6265,34 @@ class NotionStyleKanbanPlugin extends obsidian.Plugin {
     this.activeOptions.open();
   }
 
+  // One-time clean-up (0.18.0): notes that got a separate "Notes Status" property go back to
+  // Status, now that each database can have its own Status options.
+  async mergeNotesStatus() {
+    const OLD = "Notes Status";
+    const todo = [];
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      const fm = (this.app.metadataCache.getFileCache(file) || {}).frontmatter;
+      if (fm && Object.keys(fm).some((k) => sameText(k, OLD))) todo.push(file);
+    }
+    if (!todo.length) return new obsidian.Notice('No notes have a "Notes Status" property.');
+    const run = async () => {
+      let n = 0;
+      for (const file of todo) {
+        await this.app.fileManager.processFrontMatter(file, (fm) => {
+          const k = Object.keys(fm).find((x) => sameText(x, OLD));
+          if (!k) return;
+          const v = asString(Array.isArray(fm[k]) ? fm[k][0] : fm[k]).trim();
+          const sk = Object.keys(fm).find((x) => sameText(x, "Status")) || "Status";
+          if (v) fm[sk] = v;
+          delete fm[k];
+          n++;
+        });
+      }
+      new obsidian.Notice(`Moved "Notes Status" into Status on ${n} note${n === 1 ? "" : "s"}.`);
+    };
+    new ConfirmModal(this.app, 'Move "Notes Status" into Status?', `${todo.length} note${todo.length === 1 ? "" : "s"} have "Notes Status". Its value replaces Status (when it has one) and the "Notes Status" property is removed.`, "Move", run).open();
+  }
+
   schemaChanged() {
     this.app.workspace.trigger("nk:schema-changed");
   }
@@ -4889,7 +6305,10 @@ class NotionStyleKanbanPlugin extends obsidian.Plugin {
 
   async onExternalSettingsChange() {
     const fresh = (await this.loadData()) || {};
+    const localInbox = this.settings.inbox;
     Object.assign(this.settings, fresh);
+    this.settings.inbox = mergeInbox(localInbox, fresh.inbox);
+    if (this.reminders) this.reminders.refreshViews();
     if (this.viewTabs) this.viewTabs.refreshAll();
     this.schemaChanged();
   }
@@ -4925,6 +6344,15 @@ class NotionStyleKanbanPlugin extends obsidian.Plugin {
     this.templates = new TemplateLibrary(this);
     this.templates.load();
     this.register(() => this.templates.unload());
+
+    this.dates = new DateMentions(this);
+    this.dates.load();
+    this.reminders = new ReminderCenter(this);
+    this.reminders.load();
+    this.register(() => this.reminders.unload());
+    this.push = new ReminderPush(this);
+    this.push.load();
+    this.register(() => this.push.unload());
     // the run id on notes made by repeating templates is bookkeeping: hide it like Notion would
     if (!this.settings.propertyVisibility) this.settings.propertyVisibility = {};
     if (!this.settings.propertyVisibility[RUN_KEY]) this.settings.propertyVisibility[RUN_KEY] = "hide";
@@ -4979,6 +6407,11 @@ class NotionStyleKanbanPlugin extends obsidian.Plugin {
         if (!checking) this.openIconPicker(file, "icon");
         return true;
       },
+    });
+    this.addCommand({
+      id: "merge-notes-status",
+      name: "Move \"Notes Status\" back into Status",
+      callback: () => this.mergeNotesStatus(),
     });
     if (typeof this.registerBasesView !== "function") {
       new obsidian.Notice("Notion-style Kanban needs Obsidian 1.10 or later (Bases view API).");

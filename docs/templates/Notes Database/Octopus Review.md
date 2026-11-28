@@ -4,6 +4,7 @@ Task Board Item: []
 Related: []
 Topic: Octopus Review
 icon: "icons/document_purple"
+Date: "{{now:YYYY-MM-DDTHH:mm}}"
 Created: "{{now}}"
 title: "Octopus Review"
 ---

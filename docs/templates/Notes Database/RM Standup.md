@@ -4,6 +4,7 @@ Task Board Item: []
 Related: []
 Topic: RM Standup
 icon: "icons/document_blue"
+Date: "{{now:YYYY-MM-DDTHH:mm}}"
 Created: "{{now}}"
 title: "RM Standup"
 ---

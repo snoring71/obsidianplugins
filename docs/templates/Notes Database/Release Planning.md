@@ -4,6 +4,7 @@ Task Board Item: []
 Related: []
 Topic: Release Planning
 icon: "icons/document_green"
+Date: "{{now:YYYY-MM-DDTHH:mm}}"
 Created: "{{now}}"
 title: "Release Planning"
 ---
